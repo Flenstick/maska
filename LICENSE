@@ -24,5 +24,6 @@ SOFTWARE.
 
 Bundled third-party files:
 - models/face_detection_yunet_2023mar.onnx — YuNet, OpenCV Zoo, MIT License.
+- models/face_landmark.tflite — MediaPipe Face Mesh, Google, Apache License 2.0.
 - fonts/GolosText.ttf — Golos Text, SIL Open Font License 1.1 (family renamed to "Maska Golos").
 - fonts/IBMPlexMono-Medium.ttf — IBM Plex Mono, SIL Open Font License 1.1 (family renamed to "Maska Mono").

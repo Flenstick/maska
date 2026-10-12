@@ -1,5 +1,5 @@
 PyQt6>=6.5
-opencv-python-headless>=4.8
+opencv-python-headless==5.0.0.93
 numpy>=1.24
 pyvirtualcam>=0.11; sys_platform == "win32"
 pygrabber>=0.2; sys_platform == "win32"

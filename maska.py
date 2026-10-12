@@ -18,7 +18,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import face
 import updater
+from editor import EditDialog
 from PyQt6.QtCore import (QEasingCurve, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, QStandardPaths, Qt,
                           QThread, QTimer, pyqtProperty, pyqtSignal)
 from PyQt6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QIcon, QImage, QImageReader, QPainter, QPainterPath,
@@ -30,6 +32,7 @@ VERSION = "1.0.1"
 IS_WIN = sys.platform == "win32"
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # в сборке PyInstaller — папка распаковки
 MODEL = APP_DIR / "models/face_detection_yunet_2023mar.onnx"
+MESH_MODEL = APP_DIR / "models/face_landmark.tflite"
 if IS_WIN:
     DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "Maska"
 else:
@@ -41,7 +44,11 @@ LINE, LINE_2 = "#1f1f24", "#2e2e34"
 INK, MUTED, DIM = "#f4f4f5", "#a1a1aa", "#6b6b74"
 ACCENT, ACCENT_2, ACCENT_INK, RED = "#8fe03b", "#a6ef55", "#0c1600", "#f0445a"
 
-MODES = [("blur", "Размытие"), ("pixel", "Пиксели"), ("black", "Чёрный"), ("media", "Своя"), ("off", "Выкл")]
+COLORS = {"BG": BG, "PANEL": PANEL, "PANEL_2": PANEL_2, "HOVER": HOVER, "LINE_2": LINE_2, "INK": INK,
+          "MUTED": MUTED, "ACCENT": ACCENT}
+
+MODES = [("blur", "Размытие"), ("pixel", "Пиксели"), ("black", "Чёрный"), ("media", "Своя"), ("face", "Лицо"),
+         ("off", "Выкл")]
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif", ".heic", ".tif", ".tiff", ".jxl", ".svg"}
 ANIM_EXT = {".gif", ".apng"}  # webp тоже бывает анимированным — его узнаёт QImageReader
@@ -186,11 +193,28 @@ def fit_side(img, side=MEDIA_SIDE):
     return cv2.resize(img, (max(1, round(w * k)), max(1, round(h * k))), interpolation=cv2.INTER_AREA)
 
 
-class MediaMask:
-    """Кадр маски на момент t: картинка (в т. ч. с прозрачностью), GIF/анимированный WebP или видео по кругу."""
+def crop_frame(img, crop):
+    """Кадрирование по доле кадра: crop = [x, y, w, h] от 0 до 1."""
+    if not crop:
+        return img
+    h, w = img.shape[:2]
+    x0, y0 = int(round(crop[0] * w)), int(round(crop[1] * h))
+    x1, y1 = int(round((crop[0] + crop[2]) * w)), int(round((crop[1] + crop[3]) * h))
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, max(x1, x0 + 2)), min(h, max(y1, y0 + 2))
+    return img[y0:y1, x0:x1]
 
-    def __init__(self, path):
+
+class MediaMask:
+    """Кадр маски на момент t: картинка (в т. ч. с прозрачностью), GIF/анимированный WebP или видео по кругу.
+
+    edit — правки из окна обрезки: {"crop": [x, y, w, h] в долях кадра, "start": с, "end": с}.
+    """
+
+    def __init__(self, path, edit=None, side=MEDIA_SIDE):
         self.path = Path(path)
+        self.side = side
+        edit = edit or {}
+        self.crop = edit.get("crop")
         self.frames, self.ends, self.cap = [], None, None
         if self.path.suffix.lower() in VIDEO_EXT:
             self.cap = cv2.VideoCapture(str(self.path))
@@ -199,7 +223,14 @@ class MediaMask:
                 raise ValueError("не удалось прочитать видео")
             self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
             self.count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.pos, self.last = 0, cv2.cvtColor(fit_side(f), cv2.COLOR_BGR2BGRA)
+            self.first = max(0, int(round(float(edit.get("start") or 0) * self.fps)))
+            end = edit.get("end")
+            self.stop = int(round(float(end) * self.fps)) if end else (self.count if self.count > 0 else 0)
+            if self.first:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.first)
+                ok, f2 = self.cap.read()
+                f = f2 if ok else f
+            self.pos, self.last = self.first + 1, self._prep(f)
             self.alpha = False
             return
         reader = QImageReader(str(self.path))
@@ -209,14 +240,23 @@ class MediaMask:
             img = reader.read()
             if img.isNull():
                 break
-            self.frames.append(fit_side(qimage_to_bgra(img)))
+            self.frames.append(fit_side(crop_frame(qimage_to_bgra(img), self.crop), side))
             delays.append(max(20, reader.nextImageDelay() or 100) / 1000)
             if not reader.supportsAnimation():
                 break
         if not self.frames:
             raise ValueError(reader.errorString() or "не удалось прочитать файл")
+        if len(self.frames) > 1 and (edit.get("start") or edit.get("end")):
+            starts = np.concatenate([[0], np.cumsum(delays)[:-1]])
+            t0, t1 = float(edit.get("start") or 0), float(edit.get("end") or 1e9)
+            keep = [i for i, st in enumerate(starts) if t0 - 1e-3 <= st < t1] or [int(np.argmin(abs(starts - t0)))]
+            self.frames = [self.frames[i] for i in keep]
+            delays = [delays[i] for i in keep]
         self.ends = np.cumsum(delays)
         self.alpha = bool(self.frames[0][..., 3].min() < 250)
+
+    def _prep(self, bgr):
+        return cv2.cvtColor(fit_side(crop_frame(bgr, self.crop), self.side), cv2.COLOR_BGR2BGRA)
 
     @property
     def kind(self):
@@ -228,24 +268,24 @@ class MediaMask:
                 return self.frames[0]
             i = int(np.searchsorted(self.ends, t % self.ends[-1], side="right"))
             return self.frames[min(i, len(self.frames) - 1)]
-        target = int(t * self.fps)
-        if self.count > 0:
-            target %= self.count
-        if target < self.pos or target - self.pos > 90:  # назад или далеко вперёд — перемотка вместо чтения подряд
+        target = self.first + int(t * self.fps)
+        if self.stop > self.first:
+            target = self.first + (target - self.first) % (self.stop - self.first)
+        if target < self.pos - 1 or target - self.pos > 90:  # назад или далеко вперёд — перемотка, а не чтение подряд
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
             self.pos = target
         for _ in range(8):  # отстали — догоняем, но не больше нескольких кадров за раз
             if self.pos > target:
                 break
             ok, f = self.cap.read()
-            if not ok:  # конец ролика (или неверное число кадров) — с начала
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self.pos = 0
-                if self.count <= 0:
-                    self.count = target  # длительность не была известна — теперь известна
+            if not ok:  # конец ролика (или неверное число кадров) — с начала отрезка
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.first)
+                if self.stop <= self.first:
+                    self.stop = self.pos  # длительность не была известна — теперь известна
+                self.pos = self.first
                 break
             self.pos += 1
-            self.last = cv2.cvtColor(fit_side(f), cv2.COLOR_BGR2BGRA)
+            self.last = self._prep(f)
         return self.last
 
     def close(self):
@@ -253,15 +293,16 @@ class MediaMask:
             self.cap.release()
 
 
-def thumbnail(path, size=128):
+def thumbnail(path, size=128, edit=None):
     """Первый кадр маски как QImage для галереи."""
     try:
-        m = MediaMask(path)
+        m = MediaMask(path, edit)
         f = fit_side(m.frame(0), size)
         m.close()
     except Exception:  # noqa: BLE001 — битый файл покажем пустой плиткой
         return None
     h, w = f.shape[:2]
+    f = np.ascontiguousarray(f)
     return QImage(f.data, w, h, w * 4, QImage.Format.Format_ARGB32).copy()
 
 
@@ -317,11 +358,26 @@ class Library:
         MASKS_DIR.mkdir(parents=True, exist_ok=True)
         self.index.write_text(json.dumps(self.items, ensure_ascii=False, indent=1), encoding="utf-8")
 
+    def get(self, mid):
+        return next((m for m in self.items if m["id"] == mid), None)
+
     def path(self, mid):
-        for m in self.items:
-            if m["id"] == mid:
-                return MASKS_DIR / m["file"]
-        return None
+        m = self.get(mid)
+        return MASKS_DIR / m["file"] if m else None
+
+    def spec(self, mid):
+        """(путь, правки в JSON) — по нему поток камеры понимает, что маску надо перечитать."""
+        m = self.get(mid)
+        return (str(MASKS_DIR / m["file"]), json.dumps(m.get("edit") or {}, sort_keys=True)) if m else None
+
+    def set_edit(self, mid, edit):
+        m = self.get(mid)
+        if m is not None:
+            if edit:
+                m["edit"] = edit
+            else:
+                m.pop("edit", None)
+            self.save()
 
     def add(self, src):
         src = Path(src)
@@ -411,6 +467,7 @@ class Worker(QThread):
     stats = pyqtSignal(float, int, bool)
     error = pyqtSignal(str)
     vcam_state = pyqtSignal(bool, str)
+    face_state = pyqtSignal(str)  # "" — лицо с фото готово, иначе текст ошибки
 
     def __init__(self):
         super().__init__()
@@ -422,8 +479,12 @@ class Worker(QThread):
         self.mirror = True
         self.failsafe = True
         self.want_vcam = False
-        self.media_path = None   # своя маска; меняется из окна, грузится в потоке камеры
+        self.media_spec = None   # своя маска (путь, правки); меняется из окна, грузится в потоке камеры
+        self.face_spec = None    # фото для замены лица (путь, правки)
         self.rotate = True       # своя маска наклоняется вместе с головой
+        self.match_color = True  # замена лица: подгонять цвет кожи под кадр
+        self.keep_mouth = True   # замена лица: рот изнутри — из кадра
+        self.feather = 0.5       # замена лица: мягкость края 0..1
         self.snapshot_to = None
         self._restart = False
         self._running = True
@@ -452,19 +513,34 @@ class Worker(QThread):
         tracker = Tracker()
         cap = self.open_cam()
         vcam = None
-        media, media_path, media_t0 = None, None, 0.0
+        media, media_spec, media_t0 = None, None, 0.0
+        mesh, source, face_spec = None, None, None
         t_prev, fps = time.monotonic(), 0.0
         while self._running:
-            if self.media_path != media_path:
-                media_path = self.media_path
+            if self.media_spec != media_spec:
+                media_spec = self.media_spec
                 if media:
                     media.close()
                 media = None
-                if media_path:
+                if media_spec:
                     try:
-                        media, media_t0 = MediaMask(media_path), time.monotonic()
+                        media, media_t0 = MediaMask(media_spec[0], json.loads(media_spec[1])), time.monotonic()
                     except Exception as e:  # noqa: BLE001
                         self.error.emit(f"Маска не открылась: {e}")
+            if self.face_spec != face_spec:
+                face_spec, source = self.face_spec, None
+                if face_spec:
+                    try:
+                        mesh = mesh or face.FaceMesh(MESH_MODEL)
+                        m = MediaMask(face_spec[0], json.loads(face_spec[1]), side=1024)
+                        bgra = m.frame(0.0)
+                        m.close()
+                        a = bgra[..., 3:].astype(np.float32) / 255.0  # прозрачный фон — серым, детектору так проще
+                        bgr = (bgra[..., :3] * a + 128 * (1 - a)).astype(np.uint8)
+                        source = face.FaceSource(bgr, mesh, MODEL)
+                        self.face_state.emit("")
+                    except Exception as e:  # noqa: BLE001
+                        self.face_state.emit(str(e))
             if self._restart:
                 self._restart = False
                 cap.release()
@@ -505,6 +581,20 @@ class Worker(QThread):
 
                 mode = self.mode
                 mframe = None
+                if mode == "face" and source is None:
+                    mode = "blur"  # фото не выбрано или на нём нет лица — пока просто размываем
+                if mode == "face":
+                    if self.failsafe and not live:
+                        covered = True
+                        apply_mask(img, [[0, 0, w, h]], "blur", 80, 0, False)
+                    for box, lost in live:
+                        rect = [v / scale for v in box[:4]]
+                        pts = mesh.landmarks(img, rect, box[4])
+                        if pts is None or not face.swap_face(img, pts, source, self.feather, self.match_color,
+                                                             self.keep_mouth):
+                            # сетка не легла (поворот, рука у лица) — прячем размытием, как обычно
+                            apply_mask(img, [rect], "blur", 80, self.pad + min(0.6, lost * 0.4), True)
+                    mode = "off"
                 if mode == "media":
                     if media is None:
                         mode = "blur"  # маска не выбрана или не открылась — лицо всё равно прячем
@@ -815,10 +905,11 @@ class ToggleRow(QWidget):
 
 
 class MaskGallery(QWidget):
-    """Плитки своих масок; последняя плитка «+» добавляет файл. ПКМ по плитке — удалить."""
+    """Плитки своих масок; последняя плитка «+» добавляет файл. ПКМ — обрезать или удалить, двойной щелчок — обрезать."""
     picked = pyqtSignal(str)
     add_clicked = pyqtSignal()
     remove_clicked = pyqtSignal(str)
+    edit_clicked = pyqtSignal(str)
 
     COLS, GAP = 4, 8
 
@@ -882,10 +973,17 @@ class MaskGallery(QWidget):
         mid = self.items[i][0]
         if e.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
+            menu.addAction("Обрезать…").triggered.connect(lambda: self.edit_clicked.emit(mid))
+            menu.addSeparator()
             menu.addAction("Удалить маску").triggered.connect(lambda: self.remove_clicked.emit(mid))
             menu.exec(e.globalPosition().toPoint())
         else:
             self.picked.emit(mid)
+
+    def mouseDoubleClickEvent(self, e):
+        i = self.at(e.position())
+        if 0 <= i < len(self.items) and e.button() == Qt.MouseButton.LeftButton:
+            self.edit_clicked.emit(self.items[i][0])
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -1025,16 +1123,22 @@ class Main(QMainWindow):
         mb.setContentsMargins(0, 4, 0, 4)
         mb.setSpacing(8)
         head = QHBoxLayout()
-        head.addWidget(section("Мои маски"))
+        self.media_title = section("Мои маски")
+        head.addWidget(self.media_title)
         head.addStretch()
         mb.addLayout(head)
         self.gallery = MaskGallery()
         mb.addWidget(self.gallery)
-        self.media_hint = caption("Картинка, GIF или видео встанет на место лица. "
-                                  "Файл можно просто перетащить в окно. PNG с прозрачностью ложится без фона.")
+        self.media_hint = caption("")
         mb.addWidget(self.media_hint)
         self.rotate = ToggleRow("Наклонять за головой", True)
         mb.addWidget(self.rotate)
+        self.match_color = ToggleRow("Подгонять цвет кожи", True, "Лицо с фото подстраивается под свет и тон кожи в кадре.")
+        mb.addWidget(self.match_color)
+        self.keep_mouth = ToggleRow("Свой рот", True, "Когда говорите, видны настоящие губы изнутри и зубы — выглядит живее.")
+        mb.addWidget(self.keep_mouth)
+        self.feather = SliderRow("Мягкость края", 0, 100, 50, lambda v: f"{v}%")
+        mb.addWidget(self.feather)
         s.addWidget(self.media_box)
 
         self.strength = SliderRow("Сила", 0, 100, 60, lambda v: f"{v}%")
@@ -1106,6 +1210,11 @@ class Main(QMainWindow):
         self.failsafe.toggle.toggled.connect(lambda v: setattr(self.worker, "failsafe", v))
         self.mirror.toggle.toggled.connect(lambda v: setattr(self.worker, "mirror", v))
         self.rotate.toggle.toggled.connect(lambda v: setattr(self.worker, "rotate", v))
+        self.match_color.toggle.toggled.connect(lambda v: setattr(self.worker, "match_color", v))
+        self.keep_mouth.toggle.toggled.connect(lambda v: setattr(self.worker, "keep_mouth", v))
+        self.feather.slider.valueChanged.connect(lambda v: setattr(self.worker, "feather", v / 100))
+        self.gallery.edit_clicked.connect(self.edit_mask)
+        self.worker.face_state.connect(self.on_face_state)
         self.vcam.toggle.toggled.connect(lambda v: setattr(self.worker, "want_vcam", v))
         self.cam.currentIndexChanged.connect(lambda _: self.worker.switch_device(self.cam.currentData()))
         self.gallery.picked.connect(self.pick_mask)
@@ -1120,22 +1229,26 @@ class Main(QMainWindow):
         st = self.settings
         self.strength.slider.setValue(int(st.value("strength", 60)))
         self.pad.slider.setValue(int(st.value("pad", 25)))
+        self.feather.slider.setValue(int(st.value("feather", 50)))
         for row, key in ((self.oval, "oval"), (self.failsafe, "failsafe"), (self.mirror, "mirror"),
-                         (self.rotate, "rotate")):
+                         (self.rotate, "rotate"), (self.match_color, "match_color"), (self.keep_mouth, "keep_mouth")):
             row.toggle.setChecked(st.value(key, True, type=bool))
             row.toggle.set_knob(1.0 if row.toggle.isChecked() else 0.0)
         w = self.worker
         w.strength, w.pad = self.strength.slider.value(), self.pad.slider.value() / 100
         w.oval, w.failsafe = self.oval.toggle.isChecked(), self.failsafe.toggle.isChecked()
         w.mirror, w.rotate = self.mirror.toggle.isChecked(), self.rotate.toggle.isChecked()
+        w.match_color, w.keep_mouth = self.match_color.toggle.isChecked(), self.keep_mouth.toggle.isChecked()
+        w.feather = self.feather.slider.value() / 100
 
         cam = st.value("camera", "")
         i = next((n for n, (_, name) in enumerate(self.cams) if name == cam), 0)
         self.cam.setCurrentIndex(i)
         w.device = self.cam.currentData()
 
-        self.refresh_gallery()
+        self.cur_mask = self.cur_face = None
         self.set_mask(st.value("mask", ""))
+        self.set_face(st.value("face", ""))
         keys = [k for k, _ in MODES]
         mode = st.value("mode", "blur")
         self.mode.select(keys.index(mode) if mode in keys else 0, animate=False)
@@ -1151,11 +1264,13 @@ class Main(QMainWindow):
     def save(self):
         st = self.settings
         st.setValue("mode", self.worker.mode)
-        st.setValue("mask", self.gallery.current or "")
+        st.setValue("mask", self.cur_mask or "")
+        st.setValue("face", self.cur_face or "")
+        st.setValue("feather", self.feather.slider.value())
         st.setValue("strength", self.strength.slider.value())
         st.setValue("pad", self.pad.slider.value())
         for row, key in ((self.oval, "oval"), (self.failsafe, "failsafe"), (self.mirror, "mirror"),
-                         (self.rotate, "rotate")):
+                         (self.rotate, "rotate"), (self.match_color, "match_color"), (self.keep_mouth, "keep_mouth")):
             st.setValue(key, row.toggle.isChecked())
         if self.cams:
             st.setValue("camera", self.cams[self.cam.currentIndex()][1])
@@ -1163,49 +1278,89 @@ class Main(QMainWindow):
 
     # ── свои маски ──
 
+    def face_mode(self):
+        return self.worker.mode == "face"
+
     def refresh_gallery(self):
         items = []
         for m in self.library.items:
             mid = m["id"]
-            if mid not in self.thumbs:
+            key = (mid, json.dumps(m.get("edit") or {}, sort_keys=True))
+            if self.thumbs.get(mid, (None,))[0] != key:
                 path = MASKS_DIR / m["file"]
                 ext = path.suffix.lower()
                 kind = "video" if ext in VIDEO_EXT else "anim" if ext in ANIM_EXT else "image"
                 if ext == ".webp":
                     r = QImageReader(str(path))
                     kind = "anim" if r.supportsAnimation() and r.imageCount() > 1 else "image"
-                self.thumbs[mid] = (thumbnail(path), kind)
-            img, kind = self.thumbs[mid]
+                self.thumbs[mid] = (key, thumbnail(path, edit=m.get("edit")), kind)
+            _, img, kind = self.thumbs[mid]
+            if self.face_mode() and kind != "image":
+                continue  # лицо берётся только с фото
             items.append((mid, m["name"], img, kind))
+        self.gallery.current = self.cur_face if self.face_mode() else self.cur_mask
         self.gallery.set_items(items)
 
     def set_mask(self, mid):
-        path = self.library.path(mid) if mid else None
-        self.gallery.current = mid if path else None
-        self.worker.media_path = str(path) if path else None
+        spec = self.library.spec(mid) if mid else None
+        self.cur_mask = mid if spec else None
+        self.worker.media_spec = spec
+        if not self.face_mode():
+            self.gallery.current = self.cur_mask
+        self.gallery.update()
+
+    def set_face(self, mid):
+        spec = self.library.spec(mid) if mid else None
+        self.cur_face = mid if spec else None
+        self.worker.face_spec = spec
+        if self.face_mode():
+            self.gallery.current = self.cur_face
         self.gallery.update()
 
     def pick_mask(self, mid):
+        if self.face_mode():
+            self.set_face(mid)
+            return
         self.set_mask(mid)
         if self.worker.mode != "media":
             self.mode.select([k for k, _ in MODES].index("media"))
 
     def add_files(self, paths):
-        mid = None
-        bad = []
+        added, bad = [], []
         for p in paths:
-            if Path(p).suffix.lower() not in MEDIA_EXT:
+            ext = Path(p).suffix.lower()
+            if ext not in MEDIA_EXT or (self.face_mode() and ext not in IMAGE_EXT):
                 bad.append(Path(p).name)
                 continue
             try:
-                mid = self.library.add(p)
+                added.append(self.library.add(p))
             except OSError as e:
                 bad.append(f"{Path(p).name} ({e.strerror})")
         self.refresh_gallery()
-        if mid:
-            self.pick_mask(mid)
+        if added:
+            self.pick_mask(added[-1])
+            if len(added) == 1:  # один файл — сразу предлагаем обрезать
+                QTimer.singleShot(0, lambda: self.edit_mask(added[0]))
         if bad:
-            self.toast("Не подходит: " + ", ".join(bad))
+            self.toast(("Для лица нужно фото: " if self.face_mode() else "Не подходит: ") + ", ".join(bad))
+
+    def edit_mask(self, mid):
+        m = self.library.get(mid)
+        if not m:
+            return
+        try:
+            dlg = EditDialog(self, str(MASKS_DIR / m["file"]), m["name"], m.get("edit"), MediaMask, Segmented, COLORS)
+        except Exception as e:  # noqa: BLE001
+            self.toast(f"Не открылось: {e}")
+            return
+        if dlg.exec() != EditDialog.DialogCode.Accepted:
+            return
+        self.library.set_edit(mid, dlg.result_edit())
+        self.refresh_gallery()
+        if mid == self.cur_mask:
+            self.set_mask(mid)
+        if mid == self.cur_face:
+            self.set_face(mid)
 
     def add_dialog(self):
         start = self.settings.value("last_dir", str(Path.home()))
@@ -1216,8 +1371,10 @@ class Main(QMainWindow):
             self.add_files(files)
 
     def remove_mask(self, mid):
-        if self.gallery.current == mid:
+        if self.cur_mask == mid:
             self.set_mask(None)
+        if self.cur_face == mid:
+            self.set_face(None)
         self.library.remove(mid)
         self.thumbs.pop(mid, None)
         self.refresh_gallery()
@@ -1289,12 +1446,31 @@ class Main(QMainWindow):
 
     def on_mode(self, mode):
         self.worker.mode = mode
-        media = mode == "media"
-        self.media_box.setVisible(media)
-        self.strength.setVisible(not media)
+        media, swap = mode == "media", mode == "face"
+        self.media_box.setVisible(media or swap)
+        self.media_title.setText("ЧУЖОЕ ЛИЦО" if swap else "МОИ МАСКИ")
+        self.media_hint.setText(
+            "Фото человека — его лицо натянется на ваше и будет повторять мимику. Лучше всего — фото анфас при "
+            "ровном свете. Двойной щелчок по фото — обрезать, если на нём несколько лиц." if swap else
+            "Картинка, GIF или видео встанет на место лица. Файл можно просто перетащить в окно. "
+            "Двойной щелчок по маске — обрезать. PNG с прозрачностью ложится без фона.")
+        self.rotate.setVisible(media)
+        for row in (self.match_color, self.keep_mouth, self.feather):
+            row.setVisible(swap)
+        self.strength.setVisible(not media and not swap)
         self.strength.setEnabled(mode in ("blur", "pixel"))
-        if media and not self.gallery.current:
+        self.pad.setVisible(not swap)
+        self.oval.setVisible(not swap)
+        self.refresh_gallery()
+        if media and not self.cur_mask:
             self.toast("Добавьте картинку, GIF или видео — пока лицо просто размыто")
+        if swap and not self.cur_face:
+            self.toast("Добавьте фото с лицом — пока лицо просто размыто")
+
+    def on_face_state(self, err):
+        if err:
+            self.toast(f"Это фото не подходит: {err}. Обрежьте его вокруг лица или выберите другое")
+            self.preview.set_message(f"Это фото не подходит: {err}")
 
     def on_stats(self, fps, faces, covered):
         if covered:
@@ -1357,6 +1533,7 @@ def main():
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
         os.environ["MASKA_SELFTEST"] = "1"
         cv2.FaceDetectorYN.create(str(MODEL), "", (320, 320), 0.5, 0.3, 50)
+        face.FaceMesh(MESH_MODEL).landmarks(np.full((240, 320, 3), 128, np.uint8), (100, 60, 120, 120))
     elif not IS_WIN:
         os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
     app = QApplication(sys.argv)
