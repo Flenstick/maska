@@ -134,7 +134,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## Под капотом
 
-Python + PyQt6. Лица ищет [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) из OpenCV,
+Python + PyQt6. Новые версии программа находит сама: на Windows и в пакете Arch обновление ставится кнопкой «Обновить». Лица ищет [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) из OpenCV,
 между кадрами их ведёт оптический поток Лукаса — Канаде. Наклон головы считается по линии глаз.
 Виртуальная камера на Linux пишет кадры прямо в `v4l2loopback` (I420), на Windows работает через
 [pyvirtualcam](https://github.com/letmaik/pyvirtualcam) и камеру OBS.

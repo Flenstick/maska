@@ -43,3 +43,5 @@ Name: "{autodesktop}\Маска"; Filename: "{app}\Maska.exe"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\Maska.exe"; Description: "{cm:LaunchProgram,Маска}"; Flags: nowait postinstall skipifsilent
+; автообновление запускает установщик с /SILENT — тогда новую версию открываем сами
+Filename: "{app}\Maska.exe"; Flags: nowait; Check: WizardSilent

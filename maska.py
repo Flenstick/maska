@@ -17,6 +17,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+import updater
 from PyQt6.QtCore import (QEasingCurve, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, QStandardPaths, Qt,
                           QThread, QTimer, pyqtProperty, pyqtSignal)
 from PyQt6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QIcon, QImage, QImageReader, QPainter, QPainterPath,
@@ -87,7 +89,7 @@ class Tracker:
     def flow(self, gray, box):
         """Сдвиг коробки по оптическому потоку от прошлого кадра; None — точки потеряны."""
         H, W = gray.shape
-        x, y, w, h = (int(v) for v in box)
+        x, y, w, h = (int(v) for v in box[:4])  # пятое число — наклон головы
         x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
         if x1 - x0 < 8 or y1 - y0 < 8:
             return None
@@ -526,6 +528,7 @@ class Worker(QThread):
                                         box[4] if self.rotate else 0.0, cover=not media.alpha)
             except Exception as e:  # noqa: BLE001 — что бы ни сломалось, лицо не должно утечь
                 img[:] = 0
+                tracker = Tracker()  # сбрасываем дорожки, чтобы одна сломанная не держала кадр чёрным
                 covered, faces_n, now = True, 0, time.monotonic()
                 self.error.emit(f"Ошибка обработки, кадр закрыт: {e}")
 
@@ -958,6 +961,9 @@ QPushButton:hover {{ background: {HOVER}; }}
 QPushButton#primary {{ background: {ACCENT}; color: {ACCENT_INK}; border: none; }}
 QPushButton#primary:hover {{ background: {ACCENT_2}; }}
 QPushButton#primary:pressed {{ background: #7bc92f; }}
+QPushButton#update {{ background: transparent; color: {ACCENT}; border: 1px solid {ACCENT}; }}
+QPushButton#update:hover {{ background: rgba(143, 224, 59, 0.12); }}
+QPushButton#update:disabled {{ color: {MUTED}; border-color: {LINE_2}; }}
 QMenu {{ background: {PANEL_2}; border: 1px solid {LINE_2}; border-radius: 8px; padding: 4px; }}
 QMenu::item {{ padding: 6px 14px; border-radius: 6px; }}
 QMenu::item:selected {{ background: {HOVER}; }}
@@ -1061,6 +1067,11 @@ class Main(QMainWindow):
         bottom = QVBoxLayout()
         bottom.setContentsMargins(18, 0, 18, 0)
         bottom.setSpacing(10)
+        self.update_btn = QPushButton(objectName="update")
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.hide()
+        self.update_btn.clicked.connect(self.start_update)
+        bottom.addWidget(self.update_btn)
         self.stats = QLabel("—", objectName="stats")
         bottom.addWidget(self.stats)
         shot = QPushButton("Сделать снимок", objectName="primary")
@@ -1074,6 +1085,15 @@ class Main(QMainWindow):
         self.worker.stats.connect(self.on_stats)
         self.worker.error.connect(self.preview.set_message)
         self.worker.vcam_state.connect(self.on_vcam)
+
+        self.update_kind = updater.install_kind(APP_DIR)
+        self.update_info = None
+        self.checker = None
+        if not os.environ.get("MASKA_SELFTEST") and not os.environ.get("MASKA_NO_UPDATE"):
+            QTimer.singleShot(3000, self.check_update)
+            self.update_timer = QTimer(self, interval=6 * 3600 * 1000)
+            self.update_timer.timeout.connect(self.check_update)
+            self.update_timer.start()
 
         self.toast_timer = QTimer(self, singleShot=True, interval=2500)
         self.toast_timer.timeout.connect(lambda: self.preview.set_message(None))
@@ -1209,6 +1229,61 @@ class Main(QMainWindow):
 
     def dropEvent(self, e):
         self.add_files([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
+
+    # ── обновления ──
+
+    def check_update(self):
+        if self.checker and self.checker.isRunning() or self.update_info and self.update_info.get("busy"):
+            return
+        self.checker = updater.Checker(VERSION, self.update_kind)
+        self.checker.found.connect(self.on_update_found)
+        self.checker.start()
+
+    def on_update_found(self, version, page, asset):
+        self.update_info = {"version": version, "page": page, "asset": asset}
+        auto = asset is not None
+        self.update_btn.setText(f"Обновить до {version}" if auto else f"Вышла версия {version} — открыть")
+        self.update_btn.setToolTip("Скачать и установить новую версию" if auto else page)
+        self.update_btn.setEnabled(True)
+        self.update_btn.show()
+
+    def start_update(self):
+        info = self.update_info
+        if not info:
+            return
+        if info["asset"] is None:
+            from PyQt6.QtCore import QUrl
+            from PyQt6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl(info["page"]))
+            return
+        info["busy"] = True
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("Скачиваю обновление…")
+        self.installer = updater.Installer(info["asset"], self.update_kind)
+        self.installer.progress.connect(lambda v: self.update_btn.setText(f"Скачиваю обновление… {v}%"))
+        self.installer.done.connect(self.on_update_done)
+        self.installer.start()
+
+    def on_update_done(self, err):
+        info = self.update_info
+        info["busy"] = False
+        if err:
+            self.update_btn.setEnabled(True)
+            self.update_btn.setText(f"Обновить до {info['version']}")
+            self.toast(f"Обновление не удалось: {err}")
+            return
+        if IS_WIN:
+            self.close()  # установщик уже запущен: он поставит новую версию и откроет её
+            QApplication.quit()
+        else:
+            self.update_btn.setText(f"Версия {info['version']} установлена — перезапустить")
+            self.update_btn.setEnabled(True)
+            self.update_btn.clicked.disconnect()
+            self.update_btn.clicked.connect(self.restart)
+
+    def restart(self):
+        self.close()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     # ── прочее ──
 

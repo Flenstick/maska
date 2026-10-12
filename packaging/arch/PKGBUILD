@@ -24,7 +24,7 @@ package() {
   bsdtar -xf "$srcdir/${noextract[0]}" -C "$app/vendor"
 
   cd "$srcdir/$pkgname-$pkgver"
-  install -m644 maska.py v4l2out.py icon.svg chevron.svg "$app/"
+  install -m644 maska.py v4l2out.py updater.py icon.svg chevron.svg "$app/"
   install -Dm644 -t "$app/models" models/*.onnx
   install -Dm644 -t "$app/fonts" fonts/*.ttf
   install -Dm755 setup-vcam.sh "$pkgdir/usr/bin/maska-setup-vcam"
