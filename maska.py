@@ -391,7 +391,15 @@ def open_vcam(w, h):
     """Виртуальная камера: Linux — v4l2loopback напрямую, Windows — камера OBS через pyvirtualcam."""
     if not IS_WIN:
         import v4l2out
-        return v4l2out.Camera(w, h, loopback_device())
+        try:
+            return v4l2out.Camera(w, h, loopback_device())
+        except OSError:
+            try:  # запасной путь, если pyvirtualcam установлен (запуск из исходников)
+                import pyvirtualcam
+            except ImportError:
+                raise
+            return pyvirtualcam.Camera(w, h, 30, fmt=pyvirtualcam.PixelFormat.BGR, backend="v4l2loopback",
+                                       device=loopback_device())
     import pyvirtualcam
     return pyvirtualcam.Camera(w, h, 30, fmt=pyvirtualcam.PixelFormat.BGR)
 

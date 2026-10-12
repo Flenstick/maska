@@ -101,8 +101,11 @@ jobs:
           cat >> notes.md <<'MD'
 
           ### Установка
-          **Windows** — скачайте `Maska-Setup-…exe` ниже и запустите (или портативный zip).
-          **Arch Linux** — одной командой:
+
+          **Windows**: скачайте `Maska-Setup-…exe` ниже и запустите (или портативный zip).
+          Для Discord нужна виртуальная камера OBS: поставьте [OBS Studio](https://obsproject.com).
+
+          **Arch Linux**: одной командой
           ```sh
           curl -fsSL https://raw.githubusercontent.com/Flenstick/maska/main/packaging/arch/install.sh | sh
           ```
