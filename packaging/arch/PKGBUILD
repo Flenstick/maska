@@ -1,7 +1,7 @@
 # Maintainer: MrFlen <132173452+Flenstick@users.noreply.github.com>
 # «Маска» для Arch Linux. Установка одной командой — см. README («Arch Linux»).
 pkgname=maska
-pkgver=1.2.0
+pkgver=1.3.0
 pkgrel=1
 _cvver=5.0.0.93
 pkgdesc='Камера, которая прячет лицо: размытие, пиксели, своя маска из картинки, GIF или видео, замена лица и фона'
