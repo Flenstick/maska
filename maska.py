@@ -10,6 +10,7 @@ import json
 import math
 import os
 import shutil
+import tempfile
 import sys
 import time
 import uuid
@@ -18,6 +19,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import effects
 import face
 import updater
 from editor import EditDialog
@@ -514,6 +516,8 @@ class Worker(QThread):
         self.match_color = True  # замена лица: подгонять цвет кожи под кадр
         self.keep_mouth = True   # замена лица: рот изнутри — из кадра
         self.feather = 0.5       # замена лица: мягкость края 0..1
+        self.effects = set()     # включённые эффекты (effects.EFFECTS)
+        self.effect_opts = {"laser_color": "red"}
         self.snapshot_to = None
         self._restart = False
         self._running = True
@@ -627,6 +631,11 @@ class Worker(QThread):
 
                 mode = self.mode
                 mframe = None
+                # точки лица считаем по чистому кадру — до размытия и замены (нужны лицу и эффектам)
+                want_pts = mesh is not None and (self.effects or (mode == "face" and source is not None))
+                for t in live_tracks:
+                    t["pts"] = (face.track_points(mesh, img, [v / scale for v in t["box"][:4]], t["box"][4],
+                                                  t.setdefault("mesh", {}), now) if want_pts else None)
                 if mode == "face" and source is None:
                     mode = "blur"  # фото не выбрано или на нём нет лица — пока просто размываем
                 if mode == "face":
@@ -636,7 +645,7 @@ class Worker(QThread):
                     for t in live_tracks:
                         box, lost = t["box"], now - t["seen"]
                         rect = [v / scale for v in box[:4]]
-                        pts = face.track_points(mesh, img, rect, box[4], t.setdefault("mesh", {}), now)
+                        pts = t["pts"]
                         if pts is None or not face.swap_face(img, pts, source, self.feather, self.match_color,
                                                              self.keep_mouth, t.setdefault("face", {})):
                             # сетка не легла (поворот, рука у лица) — прячем размытием, как обычно
@@ -663,6 +672,10 @@ class Worker(QThread):
                         else:
                             apply_media(img, rect, mframe, media.alpha, self.pad + grow, self.oval,
                                         box[4] if self.rotate else 0.0, cover=not media.alpha)
+                if self.effects:
+                    for t in live_tracks:
+                        if t.get("pts") is not None:
+                            effects.apply(img, t["pts"], t.setdefault("fx", {}), now, self.effects, self.effect_opts)
             except Exception as e:  # noqa: BLE001 — что бы ни сломалось, лицо не должно утечь
                 img[:] = 0
                 tracker = Tracker()  # сбрасываем дорожки, чтобы одна сломанная не держала кадр чёрным
@@ -1078,6 +1091,47 @@ class MaskGallery(QWidget):
         p.drawLine(QPointF(c.x(), c.y() - k), QPointF(c.x(), c.y() + k))
 
 
+class ColorChips(QWidget):
+    """Кружки цветов; выбранный — в кольце."""
+    changed = pyqtSignal(str)
+
+    def __init__(self, items):
+        super().__init__()
+        self.items = items  # [(ключ, "#rrggbb")]
+        self.current = items[0][0]
+        self.setFixedHeight(30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def at(self, x):
+        i = int(x // 34)
+        return self.items[i][0] if 0 <= i < len(self.items) else None
+
+    def mousePressEvent(self, e):
+        k = self.at(e.position().x())
+        if k and k != self.current:
+            self.current = k
+            self.update()
+            self.changed.emit(k)
+
+    def set_current(self, k):
+        if any(k == key for key, _ in self.items):
+            self.current = k
+            self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for i, (key, hexc) in enumerate(self.items):
+            c = QPointF(15 + i * 34, 15)
+            if key == self.current:
+                p.setPen(QPen(QColor(INK), 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(c, 13, 13)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(hexc))
+            p.drawEllipse(c, 9, 9)
+
+
 QSS = f"""
 * {{ font-family: "Maska Golos"; font-size: 13.5px; color: {INK}; }}
 QMainWindow, #root {{ background: {BG}; }}
@@ -1118,6 +1172,34 @@ QScrollBar::handle:vertical {{ background: {LINE_2}; border-radius: 3px; min-hei
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QToolTip {{ background: {PANEL_2}; color: {INK}; border: 1px solid {LINE_2}; border-radius: 6px; padding: 4px 8px; }}
 """
+
+
+class Fetcher(QThread):
+    """Скачивает картинку, GIF или видео по ссылке из буфера обмена."""
+    done = pyqtSignal(str, str)  # путь, ошибка
+
+    def __init__(self, url, folder, stem):
+        super().__init__()
+        self.url, self.folder, self.stem = url, Path(folder), stem
+
+    def run(self):
+        import urllib.request
+        try:
+            req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0 Maska"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+                ext = Path(self.url.split("?")[0]).suffix.lower()
+                if ext not in MEDIA_EXT:
+                    ext = {"image/gif": ".gif", "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+                           "video/mp4": ".mp4", "video/webm": ".webm"}.get(ctype, "")
+                if not ext:
+                    raise ValueError("по ссылке не картинка и не видео")
+                data = r.read(200 * 1024 * 1024)
+            path = self.folder / (self.stem + ext)
+            path.write_bytes(data)
+            self.done.emit(str(path), "")
+        except Exception as e:  # noqa: BLE001
+            self.done.emit("", str(e))
 
 
 class Main(QMainWindow):
@@ -1200,6 +1282,18 @@ class Main(QMainWindow):
         s.addWidget(self.failsafe)
         s.addSpacing(8)
 
+        s.addWidget(section("Эффекты"))
+        self.fx_rows = {}
+        for key, label in effects.EFFECTS:
+            row = ToggleRow(label, False, "Лучи бьют туда, куда повёрнута голова. Работает с любым режимом."
+                            if key == "lasers" else None)
+            s.addWidget(row)
+            self.fx_rows[key] = row
+        self.laser_colors = ColorChips([(k, v[1]) for k, v in effects.LASER_COLORS.items()])
+        self.laser_colors.setVisible(False)
+        s.addWidget(self.laser_colors)
+        s.addSpacing(8)
+
         s.addWidget(section("Камера"))
         self.cam = QComboBox()
         self.cam.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1261,6 +1355,11 @@ class Main(QMainWindow):
         self.keep_mouth.toggle.toggled.connect(lambda v: setattr(self.worker, "keep_mouth", v))
         self.feather.slider.valueChanged.connect(lambda v: setattr(self.worker, "feather", v / 100))
         self.gallery.edit_clicked.connect(self.edit_mask)
+        for key, row in self.fx_rows.items():
+            row.toggle.toggled.connect(lambda on, k=key: self.set_effect(k, on))
+        self.laser_colors.changed.connect(lambda c: self.worker.effect_opts.__setitem__("laser_color", c))
+        from PyQt6.QtGui import QKeySequence, QShortcut
+        QShortcut(QKeySequence.StandardKey.Paste, self, activated=self.paste)
         self.worker.face_state.connect(self.on_face_state)
         self.vcam.toggle.toggled.connect(lambda v: setattr(self.worker, "want_vcam", v))
         self.cam.currentIndexChanged.connect(lambda _: self.worker.switch_device(self.cam.currentData()))
@@ -1293,6 +1392,13 @@ class Main(QMainWindow):
         self.cam.setCurrentIndex(i)
         w.device = self.cam.currentData()
 
+        for k in (st.value("effects", "") or "").split(","):
+            if k in self.fx_rows:
+                self.fx_rows[k].toggle.setChecked(True)
+                self.fx_rows[k].toggle.set_knob(1.0)
+                self.set_effect(k, True)
+        self.laser_colors.set_current(st.value("laser_color", "red"))
+        w.effect_opts["laser_color"] = self.laser_colors.current
         self.cur_mask = self.cur_face = None
         self.set_mask(st.value("mask", ""))
         self.set_face(st.value("face", ""))
@@ -1314,6 +1420,8 @@ class Main(QMainWindow):
         st.setValue("mask", self.cur_mask or "")
         st.setValue("face", self.cur_face or "")
         st.setValue("feather", self.feather.slider.value())
+        st.setValue("effects", ",".join(sorted(self.worker.effects)))
+        st.setValue("laser_color", self.laser_colors.current)
         st.setValue("strength", self.strength.slider.value())
         st.setValue("pad", self.pad.slider.value())
         for row, key in ((self.oval, "oval"), (self.failsafe, "failsafe"), (self.mirror, "mirror"),
@@ -1434,6 +1542,59 @@ class Main(QMainWindow):
     def dropEvent(self, e):
         self.add_files([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
 
+    # ── эффекты и вставка ──
+
+    def set_effect(self, key, on):
+        fx = set(self.worker.effects)
+        (fx.add if on else fx.discard)(key)
+        self.worker.effects = fx  # новое множество целиком — поток камеры не увидит его наполовину изменённым
+        if key == "lasers":
+            self.laser_colors.setVisible(on)
+
+    def paste(self):
+        """Ctrl+V: файл из проводника, картинка или GIF из браузера, ссылка на картинку/видео."""
+        md = QApplication.clipboard().mimeData()
+        files = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
+        if files:
+            self.add_files(files)
+            return
+        stamp = time.strftime("Вставка %H-%M-%S")
+        tmp = Path(tempfile.mkdtemp(prefix="maska-"))
+        for fmt in ("image/gif", "image/webp"):  # анимацию берём байтами — через QImage она потеряется
+            if fmt in md.formats():
+                path = tmp / f"{stamp}.{fmt.split('/')[1]}"
+                path.write_bytes(bytes(md.data(fmt)))
+                self.add_files([str(path)])
+                shutil.rmtree(tmp, ignore_errors=True)
+                return
+        if md.hasImage():
+            img = QImage(md.imageData())
+            if not img.isNull():
+                path = tmp / f"{stamp}.png"
+                img.save(str(path))
+                self.add_files([str(path)])
+                shutil.rmtree(tmp, ignore_errors=True)
+                return
+        text = md.text().strip() if md.hasText() else ""
+        if text and Path(text).is_file():
+            self.add_files([text])
+        elif text.startswith(("http://", "https://")):
+            self.toast("Скачиваю по ссылке…")
+            self.fetcher = Fetcher(text, tmp, stamp)
+            self.fetcher.done.connect(self.on_fetched)
+            self.fetcher.start()
+            return
+        else:
+            self.toast("В буфере обмена нет картинки, GIF или видео")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def on_fetched(self, path, err):
+        if err:
+            self.toast(f"Не скачалось: {err}")
+        else:
+            self.add_files([path])
+        shutil.rmtree(self.fetcher.folder, ignore_errors=True)
+
     # ── обновления ──
 
     def check_update(self):
@@ -1499,7 +1660,7 @@ class Main(QMainWindow):
         self.media_hint.setText(
             "Фото человека — его лицо натянется на ваше и будет повторять мимику. Лучше всего — фото анфас при "
             "ровном свете. Двойной щелчок по фото — обрезать, если на нём несколько лиц." if swap else
-            "Картинка, GIF или видео встанет на место лица. Файл можно просто перетащить в окно. "
+            "Картинка, GIF или видео встанет на место лица. Файл можно перетащить в окно или вставить Ctrl+V. "
             "Двойной щелчок по маске — обрезать. PNG с прозрачностью ложится без фона.")
         self.rotate.setVisible(media)
         for row in (self.match_color, self.keep_mouth, self.feather):
