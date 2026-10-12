@@ -118,6 +118,16 @@ class Tracker:
         d = np.median((nxt - pts)[ok].reshape(-1, 2), axis=0)
         return float(d[0]), float(d[1])
 
+    @staticmethod
+    def smooth(track, box, now):
+        """Рамка через One Euro (центр, размер, наклон в долях размера лица) — без дрожи на месте."""
+        x, y, w, h, a = box
+        size = track.setdefault("ref", max(w, h, 1.0))  # постоянный масштаб, иначе нормировка сама дрожит
+        filt = track.setdefault("filter", face.OneEuro(min_cutoff=0.4, beta=8.0))
+        cx, cy, fw, fh, fa = filt([(x + w / 2) / size, (y + h / 2) / size, w / size, h / size, a / 90.0], now) * \
+            [size, size, size, size, 90.0]
+        return [cx - fw / 2, cy - fh / 2, fw, fh, fa]
+
     def update(self, gray, boxes, now, scores=None):
         """Возвращает все дорожки; маскировать нужно только подтверждённые (t["ok"]), остальные — проверить сеткой."""
         scores = scores or [1.0] * len(boxes)
@@ -132,7 +142,7 @@ class Tracker:
                                     "ok": sc >= self.STRONG})
                 continue
             free.remove(best)
-            best["box"] = [o * 0.3 + n * 0.7 for o, n in zip(best["box"], box)]
+            best["box"] = self.smooth(best, box, now)
             best["seen"] = best["flow"] = now
             best["best"] = max(best["best"], sc)
             best["ok"] = best["ok"] or sc >= self.STRONG
@@ -626,7 +636,7 @@ class Worker(QThread):
                     for t in live_tracks:
                         box, lost = t["box"], now - t["seen"]
                         rect = [v / scale for v in box[:4]]
-                        pts = mesh.landmarks(img, rect, box[4])
+                        pts = face.track_points(mesh, img, rect, box[4], t.setdefault("mesh", {}), now)
                         if pts is None or not face.swap_face(img, pts, source, self.feather, self.match_color,
                                                              self.keep_mouth, t.setdefault("face", {})):
                             # сетка не легла (поворот, рука у лица) — прячем размытием, как обычно

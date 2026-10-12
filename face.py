@@ -58,6 +58,61 @@ def blink(pts, state):
     return out
 
 
+class OneEuro:
+    """Фильтр One Euro: на месте сглаживает сильно (дрожь уходит), при движении — слабо (маска не отстаёт).
+
+    Значения подаются в долях размера лица, поэтому настройки одинаково работают на близком и далёком лице.
+    """
+
+    def __init__(self, min_cutoff=0.5, beta=50.0, d_cutoff=1.0):  # подобрано замером: дрожь ×5 меньше, отставание ~1 px
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.x = self.dx = self.t = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        r = 2 * np.pi * cutoff * dt
+        return r / (r + 1)
+
+    def __call__(self, x, t):
+        x = np.asarray(x, np.float64)
+        if self.x is None or self.x.shape != x.shape or t - self.t > 0.5:  # первый кадр или долгий перерыв
+            self.x, self.dx, self.t = x.copy(), np.zeros_like(x), t
+            return x
+        dt = max(1e-3, t - self.t)
+        self.t = t
+        dx = (x - self.x) / dt
+        self.dx += self._alpha(self.d_cutoff, dt) * (dx - self.dx)
+        cutoff = self.min_cutoff + self.beta * np.abs(self.dx)
+        self.x += self._alpha(cutoff, dt) * (x - self.x)
+        return self.x.copy()
+
+
+def track_points(mesh, img, box, angle, state, now):
+    """Точки лица для дорожки с памятью между кадрами (state).
+
+    Область для сетки берётся по точкам прошлого кадра (как в MediaPipe) — рамка детектора прыгает на пару
+    пикселей каждый кадр, а с ней и точки. Результат сглаживается One Euro. None — сетка лица не легла.
+    """
+    prev = state.get("pts")
+    if prev is not None and now - state.get("t", -1) < 0.25:
+        x0, y0 = prev.min(0)
+        x1, y1 = prev.max(0)
+        er, el = prev[33], prev[263]
+        score, pts = mesh.run(img, (x0, y0, x1 - x0, y1 - y0),
+                              float(np.degrees(np.arctan2(el[1] - er[1], el[0] - er[0]))), scale=1.45)
+        if score < 0:  # потеряли — пробуем по рамке детектора
+            score, pts = mesh.run(img, box, angle)
+    else:
+        score, pts = mesh.run(img, box, angle)
+    if score < 0:
+        state.pop("pts", None)
+        return None
+    state["pts"], state["t"] = pts, now
+    size = state.setdefault("ref", float(max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1]), 1.0)))
+    filt = state.setdefault("filter", OneEuro())
+    return (filt(pts / size, now) * size).astype(np.float32)
+
+
 class FaceMesh:
     def __init__(self, model):
         engine = getattr(cv2.dnn, "ENGINE_CLASSIC", None)
