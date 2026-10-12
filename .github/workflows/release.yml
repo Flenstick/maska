@@ -1,0 +1,119 @@
+# Релиз по тегу v*: Windows (установщик + портативный zip) и Arch Linux (.pkg.tar.zst) → GitHub Release.
+# Тег ставит ./release.sh <версия>.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег для пересборки, например v1.0.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Сборка
+        run: pyinstaller --noconfirm packaging/windows/maska.spec
+      - name: Самопроверка
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\Maska\Maska.exe -ArgumentList "--selftest" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "selftest: код $($p.ExitCode)" }
+      - name: Установщик и zip
+        shell: pwsh
+        run: |
+          $v = "$env:TAG".TrimStart("v")
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\iscc.exe"
+            if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+            $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          iscc /DAppVersion=$v packaging\windows\maska.iss
+          Compress-Archive -Path dist\Maska -DestinationPath "dist\Maska-$v-Windows-portable.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/Maska-Setup-*.exe
+            dist/Maska-*-portable.zip
+
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Зависимости
+        run: |
+          pacman -Syu --noconfirm --needed git python python-pyqt6 python-numpy qt6-svg hicolor-icon-theme
+          useradd -m builder
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: makepkg
+        run: |
+          v="${TAG#v}"
+          install -d -o builder /home/builder/pkg
+          sed -e "s/^pkgver=.*/pkgver=$v/" packaging/arch/PKGBUILD > /home/builder/pkg/PKGBUILD
+          chown builder /home/builder/pkg/PKGBUILD
+          cd /home/builder/pkg && sudo -u builder makepkg -f --noconfirm
+      - name: Самопроверка
+        run: |
+          pacman -U --noconfirm /home/builder/pkg/maska-*.pkg.tar.zst
+          sudo -u builder maska --selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: /home/builder/pkg/maska-*.pkg.tar.zst
+
+  release:
+    needs: [windows, arch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Заметки к релизу
+        run: |
+          v="${TAG#v}"
+          awk -v v="$v" '$0 ~ "^## "v"( |$)" {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          cat >> notes.md <<'MD'
+
+          ### Установка
+          **Windows** — скачайте `Maska-Setup-…exe` ниже и запустите (или портативный zip).
+          **Arch Linux** — одной командой:
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/Flenstick/maska/main/packaging/arch/install.sh | sh
+          ```
+          MD
+      - name: Релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${TAG#v}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* --title "Маска $v" --notes-file notes.md
+          fi

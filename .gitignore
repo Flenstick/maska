@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+build/
+dist/
+*.spec.bak
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.tar.*
+packaging/arch/*.whl

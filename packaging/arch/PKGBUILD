@@ -1,0 +1,56 @@
+# Maintainer: MrFlen <132173452+Flenstick@users.noreply.github.com>
+# «Маска» для Arch Linux. Установка одной командой — см. README («Arch Linux»).
+pkgname=maska
+pkgver=1.0.0
+pkgrel=1
+_cvver=5.0.0.93
+pkgdesc='Камера, которая прячет лицо: размытие, пиксели или своя маска из картинки, GIF или видео'
+arch=('x86_64')
+url='https://github.com/Flenstick/maska'
+license=('MIT')
+# OpenCV берём колесом с PyPI (abi3 — переживает обновления Python): python-opencv из репозитория тянет vtk, hdf5 и openmpi
+depends=('python' 'python-pyqt6' 'python-numpy' 'qt6-svg' 'hicolor-icon-theme')
+optdepends=('v4l2loopback-dkms: виртуальная камера для Discord, OBS и браузера (в CachyOS модуль уже в ядре)')
+options=('!strip' '!debug')
+noextract=("opencv_python_headless-$_cvver-cp37-abi3-manylinux_2_28_x86_64.whl")
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "https://files.pythonhosted.org/packages/9b/21/f6ef335f6e65724aa78b8d792b48d40a48c381715f1e62f5a5049e09d07e/opencv_python_headless-$_cvver-cp37-abi3-manylinux_2_28_x86_64.whl")
+sha256sums=('SKIP'
+            'ed709fdf9aa0bd1f2ed8549e71d19449b03a675bb581eb292285f6861953be37')
+
+package() {
+  local app="$pkgdir/usr/lib/$pkgname"
+  install -d "$app/vendor"
+  bsdtar -xf "$srcdir/${noextract[0]}" -C "$app/vendor"
+
+  cd "$srcdir/$pkgname-$pkgver"
+  install -m644 maska.py v4l2out.py icon.svg chevron.svg "$app/"
+  install -Dm644 -t "$app/models" models/*.onnx
+  install -Dm644 -t "$app/fonts" fonts/*.ttf
+  install -Dm755 setup-vcam.sh "$pkgdir/usr/bin/maska-setup-vcam"
+
+  install -Dm755 /dev/stdin "$pkgdir/usr/bin/$pkgname" <<'SH'
+#!/bin/sh
+export PYTHONPATH="/usr/lib/maska/vendor${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 /usr/lib/maska/maska.py "$@"
+SH
+
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/$pkgname.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Маска
+Name[en]=Maska
+GenericName=Камера со скрытием лица
+Comment=Размытие, пиксели или своя маска из картинки, GIF или видео поверх лица
+Exec=maska
+Icon=maska
+Terminal=false
+Categories=AudioVideo;Video;
+StartupWMClass=maska
+Keywords=camera;webcam;face;blur;mask;discord;вебка;камера;лицо;маска;
+DESKTOP
+
+  install -Dm644 icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/$pkgname.svg"
+  install -Dm644 packaging/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/$pkgname.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
