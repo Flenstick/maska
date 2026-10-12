@@ -73,9 +73,16 @@ class Tracker:
     """
     FLOW_HOLD = 5.0   # сколько вести лицо без детектора, пока его держит поток
     BLIND_HOLD = 1.5  # без детектора и без потока
+    STRONG = 0.88     # с такой уверенностью детектора лицо засчитывается сразу
+    MAYBE_HOLD = 0.4  # непроверенная находка без детектора живёт недолго и потоком не ведётся
+    REJECTS = 2       # столько раз сетка лица сказала «не лицо» — находку выбрасываем
+    BAN = 3.0         # столько секунд неуверенные находки на месте отвергнутой не проверяются заново
 
     def __init__(self):
-        self.tracks = []  # {"box": [x, y, w, h], "seen": t детектора, "flow": t потока}
+        # {"box": [x, y, w, h, наклон], "seen": t детектора, "flow": t потока,
+        #  "ok": подтверждено, "best": лучшая уверенность детектора, "fake": сколько раз сетка отвергла}
+        self.tracks = []
+        self.banned = []  # [(box, до какого времени)] — места, где сетка сказала «не лицо»
         self.prev = None
 
     @staticmethod
@@ -111,34 +118,46 @@ class Tracker:
         d = np.median((nxt - pts)[ok].reshape(-1, 2), axis=0)
         return float(d[0]), float(d[1])
 
-    def update(self, gray, boxes, now):
+    def update(self, gray, boxes, now, scores=None):
+        """Возвращает все дорожки; маскировать нужно только подтверждённые (t["ok"]), остальные — проверить сеткой."""
+        scores = scores or [1.0] * len(boxes)
+        self.banned = [b for b in self.banned if b[1] > now]
         free = list(self.tracks)
-        for box in boxes:
+        for box, sc in zip(boxes, scores):
+            if sc < self.STRONG and any(self.iou(b, box) > 0.3 for b, _ in self.banned):
+                continue  # та же дверь или рука, что уже отвергли, — не тратим время на проверку
             best = max(free, key=lambda t: self.iou(t["box"], box), default=None)
             if best is None or (self.iou(best["box"], box) < 0.1 and not self.near(best["box"], box)):
-                self.tracks.append({"box": list(box), "seen": now, "flow": now})
+                self.tracks.append({"box": list(box), "seen": now, "flow": now, "best": sc, "fake": 0,
+                                    "ok": sc >= self.STRONG})
                 continue
             free.remove(best)
             best["box"] = [o * 0.3 + n * 0.7 for o, n in zip(best["box"], box)]
             best["seen"] = best["flow"] = now
+            best["best"] = max(best["best"], sc)
+            best["ok"] = best["ok"] or sc >= self.STRONG
         if self.prev is not None and self.prev.shape == gray.shape:
             for t in free:
+                if not t["ok"]:
+                    continue
                 d = self.flow(gray, t["box"])
                 if d is not None:
                     t["box"][0] += d[0]
                     t["box"][1] += d[1]
                     t["flow"] = now
         self.prev = gray
-        self.tracks = [t for t in self.tracks
-                       if now - t["seen"] <= self.FLOW_HOLD and now - t["flow"] <= self.BLIND_HOLD]
-        # две дорожки на одном лице — оставляем свежую
-        self.tracks.sort(key=lambda t: -t["seen"])
+        self.banned += [(t["box"], now + self.BAN) for t in self.tracks if t["fake"] >= self.REJECTS]
+        self.tracks = [t for t in self.tracks if t["fake"] < self.REJECTS and (
+            now - t["seen"] <= self.FLOW_HOLD and now - t["flow"] <= self.BLIND_HOLD if t["ok"]
+            else now - t["seen"] <= self.MAYBE_HOLD)]
+        # две дорожки на одном лице — оставляем подтверждённую, из них свежую
+        self.tracks.sort(key=lambda t: (not t["ok"], -t["seen"]))
         kept = []
         for t in self.tracks:
             if not any(self.iou(t["box"], k["box"]) > 0.3 for k in kept):
                 kept.append(t)
         self.tracks = kept
-        return [(t["box"], now - t["seen"]) for t in kept]
+        return kept
 
 
 def apply_mask(frame, boxes, mode, strength, pad, oval):
@@ -508,13 +527,18 @@ class Worker(QThread):
         return cap
 
     def run(self):
-        detector = cv2.FaceDetectorYN.create(str(MODEL), "", (320, 320), 0.5, 0.3, 50)
+        detector = cv2.FaceDetectorYN.create(str(MODEL), "", (320, 320), 0.6, 0.3, 50)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         tracker = Tracker()
         cap = self.open_cam()
         vcam = None
         media, media_spec, media_t0 = None, None, 0.0
-        mesh, source, face_spec = None, None, None
+        source, face_spec = None, None
+        try:
+            mesh = face.FaceMesh(MESH_MODEL)
+        except Exception as e:  # noqa: BLE001 — без сетки просто не будет проверки находок и замены лица
+            mesh = None
+            self.error.emit(f"Сетка лица не загрузилась: {e}")
         t_prev, fps = time.monotonic(), 0.0
         while self._running:
             if self.media_spec != media_spec:
@@ -531,7 +555,8 @@ class Worker(QThread):
                 face_spec, source = self.face_spec, None
                 if face_spec:
                     try:
-                        mesh = mesh or face.FaceMesh(MESH_MODEL)
+                        if mesh is None:
+                            raise RuntimeError("сетка лица не загрузилась")
                         m = MediaMask(face_spec[0], json.loads(face_spec[1]), side=1024)
                         bgra = m.frame(0.0)
                         m.close()
@@ -575,8 +600,19 @@ class Worker(QThread):
                 boxes = [] if faces is None else [[float(v) for v in f[:4]] +
                                                    [math.degrees(math.atan2(f[7] - f[5], f[6] - f[4]))]
                                                    for f in faces]
+                scores = [] if faces is None else [float(f[14]) for f in faces]
                 now = time.monotonic()
-                live = tracker.update(gray, boxes, now)
+                tracks = tracker.update(gray, boxes, now, scores)
+                # находки, в которых детектор не уверен (дверь, рука, узор на обоях), проверяем сеткой лица:
+                # у настоящего лица она уверена, у всего остального — нет
+                for t in tracks:
+                    if not t["ok"]:
+                        if mesh is None or mesh.is_face(img, [v / scale for v in t["box"][:4]], t["box"][4]):
+                            t["ok"] = True
+                        else:
+                            t["fake"] += 1
+                live = [(t["box"], now - t["seen"]) for t in tracks if t["ok"]]
+                live_tracks = [t for t in tracks if t["ok"]]
                 faces_n = len(live)
 
                 mode = self.mode
@@ -587,11 +623,12 @@ class Worker(QThread):
                     if self.failsafe and not live:
                         covered = True
                         apply_mask(img, [[0, 0, w, h]], "blur", 80, 0, False)
-                    for box, lost in live:
+                    for t in live_tracks:
+                        box, lost = t["box"], now - t["seen"]
                         rect = [v / scale for v in box[:4]]
                         pts = mesh.landmarks(img, rect, box[4])
                         if pts is None or not face.swap_face(img, pts, source, self.feather, self.match_color,
-                                                             self.keep_mouth):
+                                                             self.keep_mouth, t.setdefault("face", {})):
                             # сетка не легла (поворот, рука у лица) — прячем размытием, как обычно
                             apply_mask(img, [rect], "blur", 80, self.pad + min(0.6, lost * 0.4), True)
                     mode = "off"

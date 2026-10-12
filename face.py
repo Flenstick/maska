@@ -18,6 +18,46 @@ FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365
              149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
 
 
+# веки: пары «точка верхнего века — точка нижнего» от внешнего уголка к внутреннему (правый глаз, левый глаз)
+EYES = [
+    ([246, 161, 160, 159, 158, 157, 173], [7, 163, 144, 145, 153, 154, 155], (33, 133)),
+    ([466, 388, 387, 386, 385, 384, 398], [249, 390, 373, 374, 380, 381, 382], (263, 362)),
+]
+
+
+def eye_openness(pts, eye):
+    up, low, (c0, c1) = eye
+    width = np.linalg.norm(pts[c0] - pts[c1]) + 1e-6
+    return float(np.mean(np.linalg.norm(pts[up[2:5]] - pts[low[2:5]], axis=1)) / width)
+
+
+def blink(pts, state):
+    """Опускает веки на точках кадра, когда глаз закрывается.
+
+    Сетка ловит закрытие глаза не до конца, поэтому степень закрытия считаем от обычного открытого глаза
+    этого человека (state["eye_ref"] — медленно забываемый максимум) и дотягиваем веко сами: треугольники
+    глаза схлопываются, а кожа верхнего века с фото растягивается вниз — получается моргание.
+    """
+    out = pts.copy()
+    refs = state.setdefault("eye_ref", [0.0, 0.0])
+    closes = state.setdefault("eye_close", [0.0, 0.0])
+    for i, eye in enumerate(EYES):
+        r = eye_openness(pts, eye)
+        refs[i] = max(r, refs[i] * 0.997)                       # подстраивается под разрез глаз за пару секунд
+        rel = r / refs[i] if refs[i] > 1e-4 else 1.0
+        target = float(np.clip((0.72 - rel) / 0.32, 0.0, 1.0))  # 72 % от открытого — начинает, 40 % — закрыт
+        # закрывается быстро, открывается чуть плавнее — как настоящее веко
+        closes[i] += (target - closes[i]) * (0.85 if target > closes[i] else 0.55)
+        b = closes[i]
+        if b < 0.02:
+            continue
+        up, low, _ = eye
+        line = pts[low] + (pts[up] - pts[low]) * 0.18           # линия сомкнутых век — чуть выше нижнего
+        out[up] = pts[up] + (line - pts[up]) * b
+        out[low] = pts[low] + (line - pts[low]) * b
+    return out
+
+
 class FaceMesh:
     def __init__(self, model):
         engine = getattr(cv2.dnn, "ENGINE_CLASSIC", None)
@@ -25,13 +65,13 @@ class FaceMesh:
                     else cv2.dnn.readNetFromTFLite(str(model)))
         self.outs = self.net.getUnconnectedOutLayersNames()
 
-    def landmarks(self, img, box, angle=0.0, scale=1.6):
-        """468 точек (x, y) в координатах img для лица в box=(x, y, w, h) с наклоном angle; None — лица нет."""
+    def run(self, img, box, angle=0.0, scale=1.6):
+        """(уверенность, 468 точек в координатах img). Уверенность — логит: у лиц +15…+25, у рук и фона < 0."""
         x, y, w, h = box[:4]
         cx, cy = x + w / 2, y + h / 2
         side = max(w, h) * scale
         if side < 16:
-            return None
+            return -99.0, None
         m = cv2.getRotationMatrix2D((cx, cy), angle, MESH_SIZE / side)
         m[:, 2] += (MESH_SIZE / 2 - cx, MESH_SIZE / 2 - cy)
         crop = cv2.warpAffine(img, m, (MESH_SIZE, MESH_SIZE), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
@@ -39,11 +79,20 @@ class FaceMesh:
         res = self.net.forward(self.outs)
         lm = next(r for r in res if r.size == 1404)
         score = next((float(r.ravel()[0]) for r in res if r.size == 1), 10.0)
-        if score < 0:  # логит уверенности: < 0 — в кропе не лицо
-            return None
         pts = lm.reshape(-1, 3)[:, :2].astype(np.float64)
         inv = cv2.invertAffineTransform(m)
-        return (pts @ inv[:, :2].T + inv[:, 2]).astype(np.float32)
+        return score, (pts @ inv[:, :2].T + inv[:, 2]).astype(np.float32)
+
+    def landmarks(self, img, box, angle=0.0, scale=1.6):
+        """468 точек (x, y) в координатах img для лица в box=(x, y, w, h) с наклоном angle; None — лица нет."""
+        score, pts = self.run(img, box, angle, scale)
+        return pts if score >= 0 else None
+
+    def is_face(self, img, box, angle=0.0):
+        return self.run(img, box, angle)[0] >= FACE_SCORE
+
+
+FACE_SCORE = 2.0  # порог логита сетки: лица на проверке давали +18…+25, фон, руки и одежда — от −3.5 и ниже
 
 
 def detect_main_face(img, yunet_model):
@@ -129,8 +178,13 @@ def color_transfer(src, dst, mask):
     return cv2.cvtColor(cv2.LUT(s, lut), cv2.COLOR_LAB2BGR)
 
 
-def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=True):
-    """Рисует лицо source поверх лица с точками dst_pts прямо в frame. Возвращает False, если не вышло."""
+def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=True, state=None):
+    """Рисует лицо source поверх лица с точками dst_pts прямо в frame. Возвращает False, если не вышло.
+
+    state — словарь, живущий вместе с лицом между кадрами (для моргания); None — без моргания.
+    """
+    if state is not None:
+        dst_pts = blink(dst_pts, state)
     h, w = frame.shape[:2]
     x0, y0 = np.floor(dst_pts.min(0)).astype(int) - 4
     x1, y1 = np.ceil(dst_pts.max(0)).astype(int) + 4
@@ -146,8 +200,12 @@ def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=
     qw, qh = (rw + q - 1) // q, (rh + q - 1) // q
     idx = np.zeros((qh, qw), np.int32)
     corners = np.round(local / q).astype(np.int32)[tris]
-    for n, c in enumerate(corners, 1):
-        cv2.fillConvexPoly(idx, c, n)
+    # схлопнутые треугольники (сомкнутые веки, профиль) не рисуем: их матрица вырождена и тащит случайные пиксели
+    d = local[tris]
+    area = np.abs((d[:, 1, 0] - d[:, 0, 0]) * (d[:, 2, 1] - d[:, 0, 1])
+                  - (d[:, 2, 0] - d[:, 0, 0]) * (d[:, 1, 1] - d[:, 0, 1])) / 2
+    for n in np.flatnonzero(area > 1.5):
+        cv2.fillConvexPoly(idx, corners[n], int(n) + 1)
     aff = _affines(source.pts[tris].astype(np.float64), local[tris].astype(np.float64))
     aff = np.concatenate([np.zeros((1, 2, 3)), aff]).astype(np.float32).reshape(-1, 6)
     ys, xs = np.mgrid[0:qh, 0:qw].astype(np.float32) * q
