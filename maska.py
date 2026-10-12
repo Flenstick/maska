@@ -19,6 +19,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import background
 import effects
 import face
 import updater
@@ -35,6 +36,7 @@ IS_WIN = sys.platform == "win32"
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # в сборке PyInstaller — папка распаковки
 MODEL = APP_DIR / "models/face_detection_yunet_2023mar.onnx"
 MESH_MODEL = APP_DIR / "models/face_landmark.tflite"
+SEG_MODEL = APP_DIR / "models/selfie_segmentation_landscape.tflite"
 if IS_WIN:
     DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "Maska"
 else:
@@ -517,7 +519,10 @@ class Worker(QThread):
         self.keep_mouth = True   # замена лица: рот изнутри — из кадра
         self.feather = 0.5       # замена лица: мягкость края 0..1
         self.effects = set()     # включённые эффекты (effects.EFFECTS)
-        self.effect_opts = {"laser_color": "red"}
+        self.effect_opts = {"laser_color": "red", "laser_dir": "camera"}
+        self.bg_mode = "off"     # фон: off, blur, media, green
+        self.bg_spec = None      # картинка/GIF/видео для фона (путь, правки)
+        self.bg_blur = 60
         self.snapshot_to = None
         self._restart = False
         self._running = True
@@ -548,6 +553,7 @@ class Worker(QThread):
         vcam = None
         media, media_spec, media_t0 = None, None, 0.0
         source, face_spec = None, None
+        segmenter, bg_media, bg_spec, bg_t0 = None, None, None, 0.0
         try:
             mesh = face.FaceMesh(MESH_MODEL)
         except Exception as e:  # noqa: BLE001 — без сетки просто не будет проверки находок и замены лица
@@ -565,6 +571,16 @@ class Worker(QThread):
                         media, media_t0 = MediaMask(media_spec[0], json.loads(media_spec[1])), time.monotonic()
                     except Exception as e:  # noqa: BLE001
                         self.error.emit(f"Маска не открылась: {e}")
+            if self.bg_spec != bg_spec:
+                bg_spec = self.bg_spec
+                if bg_media:
+                    bg_media.close()
+                bg_media = None
+                if bg_spec:
+                    try:
+                        bg_media, bg_t0 = MediaMask(bg_spec[0], json.loads(bg_spec[1]), side=1280), time.monotonic()
+                    except Exception as e:  # noqa: BLE001
+                        self.error.emit(f"Фон не открылся: {e}")
             if self.face_spec != face_spec:
                 face_spec, source = self.face_spec, None
                 if face_spec:
@@ -631,6 +647,17 @@ class Worker(QThread):
 
                 mode = self.mode
                 mframe = None
+                # фон: человека вырезаем по чистому кадру, а подменяем фон уже после масок лица
+                seg_mask = None
+                if self.bg_mode != "off":
+                    if segmenter is None:
+                        try:
+                            segmenter = background.Segmenter(SEG_MODEL)
+                        except Exception as e:  # noqa: BLE001 — без модели фон просто не меняем
+                            self.bg_mode = "off"
+                            self.error.emit(f"Замена фона недоступна: {e}")
+                    if segmenter is not None:
+                        seg_mask = segmenter.mask(small)
                 # точки лица считаем по чистому кадру — до размытия и замены (нужны лицу и эффектам)
                 want_pts = mesh is not None and (self.effects or (mode == "face" and source is not None))
                 for t in live_tracks:
@@ -672,6 +699,19 @@ class Worker(QThread):
                         else:
                             apply_media(img, rect, mframe, media.alpha, self.pad + grow, self.oval,
                                         box[4] if self.rotate else 0.0, cover=not media.alpha)
+                if seg_mask is not None:
+                    if self.bg_mode == "blur":
+                        bg = background.blurred(img, self.bg_blur)
+                    elif self.bg_mode == "green":
+                        bg = np.empty_like(img)
+                        bg[:] = background.GREEN
+                    elif bg_media is not None:
+                        bgf = bg_media.frame(now - bg_t0)
+                        a = bgf[..., 3:].astype(np.float32) / 255.0  # прозрачные места картинки-фона — чёрные
+                        bg = background.cover((bgf[..., :3] * a).astype(np.uint8), w, h)
+                    else:
+                        bg = background.blurred(img, 60)  # фон не выбран — пока просто размываем
+                    background.composite(img, seg_mask, bg)
                 if self.effects:
                     for t in live_tracks:
                         if t.get("pts") is not None:
@@ -1170,6 +1210,15 @@ QScrollArea {{ background: transparent; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 6px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: {LINE_2}; border-radius: 3px; min-height: 24px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QFileDialog, QFileDialog QWidget {{ background: {PANEL}; color: {INK}; }}
+QLineEdit {{ background: {PANEL_2}; border: 1px solid {LINE_2}; border-radius: 8px; padding: 5px 8px;
+  selection-background-color: {ACCENT}; selection-color: {ACCENT_INK}; }}
+QTreeView, QListView {{ background: {PANEL_2}; alternate-background-color: {PANEL}; border: 1px solid {LINE_2};
+  border-radius: 8px; selection-background-color: {HOVER}; selection-color: {INK}; outline: none; }}
+QHeaderView::section {{ background: {PANEL}; color: {MUTED}; border: none; border-bottom: 1px solid {LINE_2};
+  padding: 4px 8px; }}
+QToolButton {{ background: transparent; border: none; border-radius: 6px; padding: 4px; }}
+QToolButton:hover {{ background: {HOVER}; }}
 QToolTip {{ background: {PANEL_2}; color: {INK}; border: 1px solid {LINE_2}; border-radius: 6px; padding: 4px 8px; }}
 """
 
@@ -1282,16 +1331,30 @@ class Main(QMainWindow):
         s.addWidget(self.failsafe)
         s.addSpacing(8)
 
+        s.addWidget(section("Фон"))
+        self.bg_mode = Segmented([("off", "Выкл"), ("blur", "Размытие"), ("media", "Своё"), ("green", "Зелёный")])
+        s.addWidget(self.bg_mode)
+        self.bg_blur = SliderRow("Сила размытия фона", 0, 100, 60, lambda v: f"{v}%")
+        s.addWidget(self.bg_blur)
+        self.bg_gallery = MaskGallery()
+        s.addWidget(self.bg_gallery)
+        self.bg_hint = caption("")
+        s.addWidget(self.bg_hint)
+        s.addSpacing(8)
+
         s.addWidget(section("Эффекты"))
         self.fx_rows = {}
         for key, label in effects.EFFECTS:
-            row = ToggleRow(label, False, "Лучи бьют туда, куда повёрнута голова. Работает с любым режимом."
+            row = ToggleRow(label, False, "Лучи светят прямо в камеру или туда, куда повёрнута голова. Работает с любым режимом."
                             if key == "lasers" else None)
             s.addWidget(row)
             self.fx_rows[key] = row
         self.laser_colors = ColorChips([(k, v[1]) for k, v in effects.LASER_COLORS.items()])
         self.laser_colors.setVisible(False)
         s.addWidget(self.laser_colors)
+        self.laser_dir = Segmented([("camera", "В камеру"), ("head", "Куда смотрит голова")])
+        self.laser_dir.setVisible(False)
+        s.addWidget(self.laser_dir)
         s.addSpacing(8)
 
         s.addWidget(section("Камера"))
@@ -1342,6 +1405,7 @@ class Main(QMainWindow):
 
         self.toast_timer = QTimer(self, singleShot=True, interval=2500)
         self.toast_timer.timeout.connect(lambda: self.preview.set_message(None))
+        self.cur_mask = self.cur_face = self.cur_bg = None
         self.restore()
 
         self.mode.changed.connect(self.on_mode)
@@ -1358,6 +1422,13 @@ class Main(QMainWindow):
         for key, row in self.fx_rows.items():
             row.toggle.toggled.connect(lambda on, k=key: self.set_effect(k, on))
         self.laser_colors.changed.connect(lambda c: self.worker.effect_opts.__setitem__("laser_color", c))
+        self.laser_dir.changed.connect(lambda d: self.worker.effect_opts.__setitem__("laser_dir", d))
+        self.bg_mode.changed.connect(self.on_bg_mode)
+        self.bg_blur.slider.valueChanged.connect(lambda v: setattr(self.worker, "bg_blur", v))
+        self.bg_gallery.picked.connect(self.set_bg)
+        self.bg_gallery.add_clicked.connect(lambda: self.add_dialog(target="bg"))
+        self.bg_gallery.remove_clicked.connect(self.remove_mask)
+        self.bg_gallery.edit_clicked.connect(self.edit_mask)
         from PyQt6.QtGui import QKeySequence, QShortcut
         QShortcut(QKeySequence.StandardKey.Paste, self, activated=self.paste)
         self.worker.face_state.connect(self.on_face_state)
@@ -1399,6 +1470,17 @@ class Main(QMainWindow):
                 self.set_effect(k, True)
         self.laser_colors.set_current(st.value("laser_color", "red"))
         w.effect_opts["laser_color"] = self.laser_colors.current
+        ldir = st.value("laser_dir", "camera")
+        self.laser_dir.select(0 if ldir != "head" else 1, animate=False)
+        w.effect_opts["laser_dir"] = "head" if ldir == "head" else "camera"
+        self.bg_blur.slider.setValue(int(st.value("bg_blur", 60)))
+        w.bg_blur = self.bg_blur.slider.value()
+        self.cur_bg = None
+        self.set_bg(st.value("bg", ""))
+        bgm = st.value("bg_mode", "off")
+        keys = [k for k, _ in self.bg_mode.items]
+        self.bg_mode.select(keys.index(bgm) if bgm in keys else 0, animate=False)
+        self.on_bg_mode(self.bg_mode.items[self.bg_mode.index][0])
         self.cur_mask = self.cur_face = None
         self.set_mask(st.value("mask", ""))
         self.set_face(st.value("face", ""))
@@ -1422,6 +1504,10 @@ class Main(QMainWindow):
         st.setValue("feather", self.feather.slider.value())
         st.setValue("effects", ",".join(sorted(self.worker.effects)))
         st.setValue("laser_color", self.laser_colors.current)
+        st.setValue("laser_dir", self.worker.effect_opts.get("laser_dir", "camera"))
+        st.setValue("bg_mode", self.worker.bg_mode)
+        st.setValue("bg", self.cur_bg or "")
+        st.setValue("bg_blur", self.bg_blur.slider.value())
         st.setValue("strength", self.strength.slider.value())
         st.setValue("pad", self.pad.slider.value())
         for row, key in ((self.oval, "oval"), (self.failsafe, "failsafe"), (self.mirror, "mirror"),
@@ -1480,24 +1566,29 @@ class Main(QMainWindow):
         if self.worker.mode != "media":
             self.mode.select([k for k, _ in MODES].index("media"))
 
-    def add_files(self, paths):
+    def add_files(self, paths, target=None):
+        """target: None — в текущий режим (маска или лицо), "bg" — как фон."""
         added, bad = [], []
         for p in paths:
             ext = Path(p).suffix.lower()
-            if ext not in MEDIA_EXT or (self.face_mode() and ext not in IMAGE_EXT):
+            if ext not in MEDIA_EXT or (target is None and self.face_mode() and ext not in IMAGE_EXT):
                 bad.append(Path(p).name)
                 continue
             try:
                 added.append(self.library.add(p))
             except OSError as e:
                 bad.append(f"{Path(p).name} ({e.strerror})")
-        self.refresh_gallery()
+        self.refresh_bg_gallery()
         if added:
-            self.pick_mask(added[-1])
+            if target == "bg":
+                self.set_bg(added[-1])
+            else:
+                self.pick_mask(added[-1])
             if len(added) == 1:  # один файл — сразу предлагаем обрезать
                 QTimer.singleShot(0, lambda: self.edit_mask(added[0]))
         if bad:
-            self.toast(("Для лица нужно фото: " if self.face_mode() else "Не подходит: ") + ", ".join(bad))
+            self.toast(("Для лица нужно фото: " if target is None and self.face_mode() else "Не подходит: ")
+                       + ", ".join(bad))
 
     def edit_mask(self, mid):
         m = self.library.get(mid)
@@ -1511,28 +1602,32 @@ class Main(QMainWindow):
         if dlg.exec() != EditDialog.DialogCode.Accepted:
             return
         self.library.set_edit(mid, dlg.result_edit())
-        self.refresh_gallery()
+        self.refresh_bg_gallery()
         if mid == self.cur_mask:
             self.set_mask(mid)
         if mid == self.cur_face:
             self.set_face(mid)
+        if mid == self.cur_bg:
+            self.set_bg(mid)
 
-    def add_dialog(self):
+    def add_dialog(self, target=None):
         start = self.settings.value("last_dir", str(Path.home()))
-        files, _ = QFileDialog.getOpenFileNames(self, "Выберите картинку, GIF или видео", start,
-                                                f"{MEDIA_FILTER};;Все файлы (*)")
+        title = "Выберите фон: картинку, GIF или видео" if target == "bg" else "Выберите картинку, GIF или видео"
+        files, _ = QFileDialog.getOpenFileNames(self, title, start, f"{MEDIA_FILTER};;Все файлы (*)")
         if files:
             self.settings.setValue("last_dir", str(Path(files[0]).parent))
-            self.add_files(files)
+            self.add_files(files, target)
 
     def remove_mask(self, mid):
         if self.cur_mask == mid:
             self.set_mask(None)
         if self.cur_face == mid:
             self.set_face(None)
+        if self.cur_bg == mid:
+            self.set_bg(None)
         self.library.remove(mid)
         self.thumbs.pop(mid, None)
-        self.refresh_gallery()
+        self.refresh_bg_gallery()
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls() and any(u.isLocalFile() and Path(u.toLocalFile()).suffix.lower() in MEDIA_EXT
@@ -1542,6 +1637,33 @@ class Main(QMainWindow):
     def dropEvent(self, e):
         self.add_files([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
 
+    # ── фон ──
+
+    def on_bg_mode(self, mode):
+        self.worker.bg_mode = mode
+        self.bg_blur.setVisible(mode == "blur")
+        self.bg_gallery.setVisible(mode == "media")
+        self.bg_hint.setVisible(mode in ("media", "green"))
+        self.bg_hint.setText("Картинка, GIF или видео за вашей спиной. Двойной щелчок — обрезать." if mode == "media"
+                             else "Ровный зелёный фон — в OBS его убирает фильтр «Хромакей».")
+        self.refresh_bg_gallery()
+
+    def refresh_bg_gallery(self):
+        self.refresh_gallery()  # обновит миниатюры
+        items = []
+        for m in self.library.items:
+            _, img, kind = self.thumbs[m["id"]]
+            items.append((m["id"], m["name"], img, kind))
+        self.bg_gallery.current = self.cur_bg
+        self.bg_gallery.set_items(items)
+
+    def set_bg(self, mid):
+        spec = self.library.spec(mid) if mid else None
+        self.cur_bg = mid if spec else None
+        self.worker.bg_spec = spec
+        self.bg_gallery.current = self.cur_bg
+        self.bg_gallery.update()
+
     # ── эффекты и вставка ──
 
     def set_effect(self, key, on):
@@ -1550,6 +1672,7 @@ class Main(QMainWindow):
         self.worker.effects = fx  # новое множество целиком — поток камеры не увидит его наполовину изменённым
         if key == "lasers":
             self.laser_colors.setVisible(on)
+            self.laser_dir.setVisible(on)
 
     def paste(self):
         """Ctrl+V: файл из проводника, картинка или GIF из браузера, ссылка на картинку/видео."""
@@ -1742,8 +1865,11 @@ def main():
         os.environ["MASKA_SELFTEST"] = "1"
         cv2.FaceDetectorYN.create(str(MODEL), "", (320, 320), 0.5, 0.3, 50)
         face.FaceMesh(MESH_MODEL).landmarks(np.full((240, 320, 3), 128, np.uint8), (100, 60, 120, 120))
+        background.Segmenter(SEG_MODEL).mask(np.full((360, 640, 3), 128, np.uint8))
     elif not IS_WIN:
         os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+        # окна «Открыть файл» — системные (GNOME, KDE) через xdg-desktop-portal, а не встроенное окно Qt
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
     app = QApplication(sys.argv)
     app.setApplicationName("Маска")
     app.setDesktopFileName("maska")

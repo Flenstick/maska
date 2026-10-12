@@ -10,7 +10,7 @@
 [![Лицензия](https://img.shields.io/github/license/Flenstick/maska?style=for-the-badge&color=2e2e34&labelColor=131316&label=лицензия)](LICENSE)
 
 **Вебка, которая сама находит лицо и закрывает его размытием, пикселями, вашей маской из картинки, GIF
-или видео или чужим лицом с фото, которое повторяет вашу мимику. А ещё лазеры из глаз. Картинка с маской уходит в Discord, OBS и браузер.**
+или видео или чужим лицом с фото, которое повторяет вашу мимику. А ещё лазеры из глаз и замена фона. Картинка с маской уходит в Discord, OBS и браузер.**
 
 [**⬇ Скачать для Windows**](https://github.com/Flenstick/maska/releases/latest) &nbsp;·&nbsp;
 [**Установить на Arch Linux**](#arch-linux) &nbsp;·&nbsp;
@@ -63,9 +63,9 @@ PNG и GIF с прозрачностью ложатся без фона, вид�
 <tr>
 <td valign="top">
 
-### 🔴 Эффекты
-Лазеры из глаз бьют туда, куда повёрнута голова, и работают поверх любого режима, даже поверх чужого лица.
-Цвет луча — на выбор.
+### 🔴 Эффекты и фон
+Лазеры из глаз светят прямо в камеру или туда, куда повёрнута голова, поверх любого режима.
+Фон за спиной: размытие, своя картинка, GIF или видео, зелёный для хромакея.
 
 </td>
 <td valign="top">
@@ -95,6 +95,8 @@ PNG и GIF с прозрачностью ложатся без фона, вид�
 </table>
 
 <div align="center">
+<img src="docs/background.png" alt="Замена фона и лазеры прямо в камеру" width="88%">
+<br><br>
 <img src="docs/lasers.png" alt="Чужое лицо и лазеры из глаз" width="88%">
 <br><br>
 <img src="docs/face-swap.png" alt="Режим «Лицо»: чужое лицо с фото поверх лица в кадре" width="88%">
@@ -184,5 +186,5 @@ Python + PyQt6. Новые версии программа находит сам
 [pyvirtualcam](https://github.com/letmaik/pyvirtualcam) и камеру OBS.
 
 <div align="center">
-<sub>MIT © MrFlen · Мона Лиза на картинках — общественное достояние · YuNet — MIT · MediaPipe Face Mesh — Apache 2.0 · шрифты Golos Text и IBM Plex Mono — OFL</sub>
+<sub>MIT © MrFlen · Мона Лиза на картинках — общественное достояние · YuNet — MIT · MediaPipe Face Mesh и Selfie Segmentation — Apache 2.0 · шрифты Golos Text и IBM Plex Mono — OFL</sub>
 </div>

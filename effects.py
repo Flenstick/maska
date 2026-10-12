@@ -53,8 +53,50 @@ def _edge_point(p, d, w, h):
     return p + d * t
 
 
-def lasers(frame, pts, state, now, color="red"):
+def lasers_camera(frame, pts, state, now, bgr):
+    """Лазеры прямо в камеру: луч бьёт в зрителя — вспышка в глазах, конус света, блик и лучи-звёздочки."""
+    h, w = frame.shape[:2]
+    q = 4
+    lw, lh = (w + q - 1) // q, (h + q - 1) // q
+    glow = np.zeros((lh, lw), np.float32)
+    streak = np.zeros((lh, lw), np.float32)
+    core = np.zeros((lh * 2, lw * 2), np.uint8)
+    eye_w = np.linalg.norm(pts[33] - pts[133]) + 1.0
+    look = head_direction(pts, state, now)
+    flick = 0.88 + 0.12 * math.sin(now * 41.0) * math.sin(now * 17.0 + 0.7)
+    spin = now * 0.6
+    for eye in eye_centers(pts):
+        e = eye / q
+        # конус: луч летит в камеру, поэтому к зрителю расширяется — и чуть уходит туда, куда повёрнута голова
+        for k in np.linspace(0.0, 1.0, 7):
+            c = e + look * 3.0 * k * eye_w * 4 / q
+            r = (0.6 + 4.5 * k) * eye_w * flick / q
+            cv2.circle(glow, tuple(np.round(c).astype(int)), max(1, int(r)), 0.16 + 0.16 * (1 - k), -1, cv2.LINE_AA)
+        cv2.circle(glow, tuple(np.round(e).astype(int)), max(2, int(eye_w * 1.1 * flick / q)), 3.0, -1, cv2.LINE_AA)
+        # блик объектива: яркая точка, потом растянутая по горизонтали — гаснет к краям сама
+        cv2.circle(streak, tuple(np.round(e).astype(int)), max(1, int(eye_w * 0.12 / q)), 60.0 * flick, -1)
+        # лучи-звёздочки, медленно вращаются
+        ce = tuple(np.round(eye / 2).astype(int))
+        for i in range(6):
+            a = spin + i * math.pi / 3
+            ln = eye_w * (1.6 + 0.4 * math.sin(now * 5 + i)) * flick / 2
+            tip = (int(ce[0] + math.cos(a) * ln), int(ce[1] + math.sin(a) * ln))
+            cv2.line(core, ce, tip, 150, 1, cv2.LINE_AA)
+        cv2.circle(core, ce, max(1, int(eye_w * 0.32 * flick / 2)), 255, -1, cv2.LINE_AA)
+    g = cv2.GaussianBlur(glow, (0, 0), max(1.0, eye_w * 0.5 / q))
+    g += cv2.GaussianBlur(glow, (0, 0), max(2.0, eye_w * 1.6 / q)) * 0.7
+    g += cv2.GaussianBlur(streak, (0, 0), sigmaX=max(4.0, lw / 7), sigmaY=max(0.6, eye_w * 0.05 / q))
+    colored = np.clip(g[..., None] * bgr[None, None], 0, 255).astype(np.uint8)
+    core = cv2.GaussianBlur(core, (0, 0), max(0.8, eye_w * 0.05 / 2))
+    light = cv2.add(cv2.resize(colored, (w, h), interpolation=cv2.INTER_LINEAR),
+                    cv2.cvtColor(cv2.resize(core, (w, h), interpolation=cv2.INTER_LINEAR), cv2.COLOR_GRAY2BGR))
+    cv2.add(frame, light, dst=frame)
+
+
+def lasers(frame, pts, state, now, color="red", direction="camera"):
     bgr = np.array(LASER_COLORS.get(color, LASER_COLORS["red"])[0], np.float32)
+    if direction == "camera":
+        return lasers_camera(frame, pts, state, now, bgr)
     h, w = frame.shape[:2]
     q, c = 4, 2  # свечение — в 1/4 разрешения, сердцевина — в 1/2: на 720p эффект укладывается в пару мс
     lw, lh = (w + q - 1) // q, (h + q - 1) // q
@@ -88,4 +130,4 @@ def lasers(frame, pts, state, now, color="red"):
 
 def apply(frame, pts, state, now, enabled, opts):
     if "lasers" in enabled:
-        lasers(frame, pts, state, now, opts.get("laser_color", "red"))
+        lasers(frame, pts, state, now, opts.get("laser_color", "red"), opts.get("laser_dir", "camera"))
