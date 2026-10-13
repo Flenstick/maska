@@ -15,8 +15,14 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
+
+# потоки OpenCV и OpenBLAS по умолчанию крутятся вхолостую в ожидании работы и отнимают ядра у игры, Discord
+# и соседних потоков конвейера (замер: −20 % процессора при тех же fps). Задаётся до импорта cv2 и numpy
+for _k, _v in (("OPENCV_THREAD_POOL_ACTIVE_WAIT_WORKER", "0"), ("OPENCV_THREAD_POOL_ACTIVE_WAIT_MAIN", "0"),
+               ("OPENBLAS_NUM_THREADS", "1")):
+    os.environ.setdefault(_k, _v)
 
 import cv2
 import numpy as np
@@ -501,6 +507,9 @@ def open_vcam(w, h):
     return pyvirtualcam.Camera(w, h, 60, fmt=pyvirtualcam.PixelFormat.BGR)
 
 
+# как часто обновлять вырезание человека для замены фона, с
+SEG_EVERY = 1 / 32
+
 # поворот головы (face.turn), начиная с которого под чужим лицом размывается вся голова
 TURN_HIDE = 0.3
 
@@ -585,6 +594,7 @@ class Worker(QThread):
         self.rotate = True       # своя маска наклоняется вместе с головой
         self.match_color = True  # замена лица: подгонять цвет кожи под кадр
         self.keep_mouth = True   # замена лица: рот изнутри — из кадра
+        self.hide_head = False   # замена лица: при повороте размывать голову под лицом
         self.feather = 0.5       # замена лица: мягкость края 0..1
         self.effects = set()     # включённые эффекты (effects.EFFECTS)
         self.effect_opts = {"laser_color": "red", "laser_dir": "camera"}
@@ -651,6 +661,7 @@ class Worker(QThread):
         source, face_spec = None, None
         segmenter, bg_media, bg_spec, bg_t0 = None, None, None, 0.0
         bg_cache = (None, None, None)  # (кадр фона, размер, готовый фон) — картинка-фон не пересчитывается
+        seg_job, seg_last, seg_t = None, None, 0.0  # вырезание человека идёт само по себе и не держит кадр
         try:
             mesh = face.FaceMesh(MESH_MODEL)
         except Exception as e:  # noqa: BLE001 — без сетки просто не будет проверки находок и замены лица
@@ -659,21 +670,27 @@ class Worker(QThread):
 
         def analyze(img, want_pts):
             """Где лица, их точки и где человек — по чистому кадру, до любой обработки."""
-            nonlocal tracker, segmenter
+            nonlocal tracker, segmenter, seg_job, seg_last, seg_t
             try:
                 h, w = img.shape[:2]
                 scale = min(1.0, 640 / w)
                 small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale < 1 else img
-                seg_job = None
-                if self.bg_mode != "off":
+                fresh = False
+                if self.bg_mode == "off":
+                    seg_job, seg_last = None, None
+                else:
                     if segmenter is None:
                         try:
                             segmenter = background.Segmenter(SEG_MODEL)
                         except Exception as e:  # noqa: BLE001 — без модели фон просто не меняем
                             self.bg_mode = "off"
                             self.error.emit(f"Замена фона недоступна: {e}")
-                    if segmenter is not None:
-                        seg_job = helper.submit(segmenter.mask, small)
+                    if seg_job is not None and seg_job.done():
+                        seg_last, seg_job = seg_job.result(), None
+                    # человек движется плавно, и маски 30 раз в секунду хватает; на 60 fps это вдвое меньше работы
+                    if segmenter is not None and seg_job is None and time.monotonic() - seg_t >= SEG_EVERY:
+                        seg_t = time.monotonic()
+                        seg_job, fresh = helper.submit(segmenter.mask, small), True
                 gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
                 detector.setInputSize((small.shape[1], small.shape[0]))
                 _, faces = detector.detect(small)
@@ -705,16 +722,23 @@ class Worker(QThread):
                     live.append({"rect": [v / scale for v in t["box"][:4]], "angle": t["box"][4],
                                  "lost": now - t["seen"], "pts": pts,
                                  "face": t.setdefault("face", {}), "fx": t.setdefault("fx", {})})
-                return {"now": now, "live": live, "seg": seg_job.result() if seg_job else None}
+                if seg_job is not None and (fresh or seg_last is None):
+                    # маску этого кадра ждём недолго: не успела — берём прошлую (сдвиг на кадр не заметен),
+                    # а не роняем частоту кадров, когда процессор занят игрой или Discord
+                    try:
+                        seg_last, seg_job = seg_job.result(timeout=None if seg_last is None else 0.004), None
+                    except FutureTimeout:
+                        pass
+                return {"now": now, "live": live, "seg": seg_last}
             except Exception as e:  # noqa: BLE001 — кадр всё равно закроется при отрисовке
                 tracker = Tracker()  # сбрасываем дорожки, чтобы одна сломанная не держала кадр чёрным
+                seg_job = None
                 return e
 
         def render(img, info):
-            """Рисует маски, лицо, фон и эффекты прямо в img. Возвращает (лиц, кадр закрыт целиком)."""
-            nonlocal bg_cache
+            """Рисует маски и лицо прямо в img. Возвращает (лиц, кадр закрыт целиком)."""
             h, w = img.shape[:2]
-            now, live, seg_mask = info["now"], info["live"], info["seg"]
+            now, live = info["now"], info["live"]
             covered = False
             mode = self.mode
             mframe = None
@@ -727,7 +751,7 @@ class Worker(QThread):
                 for t in live:
                     pts = t["pts"]
                     turn = face.turn(pts) if pts is not None else 0.0
-                    if pts is not None and abs(turn) > TURN_HIDE:
+                    if self.hide_head and pts is not None and abs(turn) > TURN_HIDE:
                         # голова повёрнута: чужое лицо закрывает только видимую половину — остальную голову
                         # (щёку, ухо, волосы, профиль) размываем под ним, а само лицо остаётся
                         face.hide_head(img, pts, min(1.0, (abs(turn) - TURN_HIDE) / 0.25), turn)
@@ -756,12 +780,21 @@ class Worker(QThread):
                     else:
                         apply_media(img, t["rect"], mframe, media.alpha, self.pad + grow, self.oval,
                                     t["angle"] if self.rotate else 0.0, cover=not media.alpha)
+            return len(live), covered
+
+        def finish(img, info):
+            """Фон и эффекты поверх готовых масок. Идёт в потоке вывода, пока рисуется следующий кадр."""
+            nonlocal bg_cache
+            h, w = img.shape[:2]
+            now, live, seg_mask = info["now"], info["live"], info["seg"]
             if seg_mask is not None and self.bg_mode != "off":
                 if self.bg_mode == "blur":
                     bg = background.blurred(img, self.bg_blur)
                 elif self.bg_mode == "green":
-                    bg = np.empty_like(img)
-                    bg[:] = background.GREEN
+                    if bg_cache[0] is not background.GREEN or bg_cache[1] != (w, h):
+                        bg_cache = (background.GREEN, (w, h), np.empty_like(img))
+                        bg_cache[2][:] = background.GREEN
+                    bg = bg_cache[2]
                 elif bg_media is not None:
                     bgf = bg_media.frame(now - bg_t0)
                     if bg_cache[0] is not bgf or bg_cache[1] != (w, h):  # картинка не меняется — считаем раз
@@ -775,9 +808,14 @@ class Worker(QThread):
                 for t in live:
                     if t["pts"] is not None:
                         effects.apply(img, t["pts"], t["fx"], now, self.effects, self.effect_opts)
-            return len(live), covered
 
-        def output(img, vcam, mirror, snap):
+        def output(img, info, vcam, mirror, snap):
+            if info is not None:
+                try:
+                    finish(img, info)
+                except Exception as e:  # noqa: BLE001 — лицо уже закрыто, но кадр без фона мог бы выдать комнату
+                    img[:] = 0
+                    self.error.emit(f"Ошибка обработки, кадр закрыт: {e}")
             if vcam is not None:
                 vcam.send(img)
             if snap:
@@ -803,6 +841,8 @@ class Worker(QThread):
                     except Exception as e:  # noqa: BLE001
                         self.error.emit(f"Маска не открылась: {e}")
             if self.bg_spec != bg_spec:
+                if sent:
+                    sent.result()  # прошлый кадр ещё дорисовывает фон из старого файла
                 bg_spec = self.bg_spec
                 if bg_media:
                     bg_media.close()
@@ -861,6 +901,7 @@ class Worker(QThread):
                 now = info["now"]
             except Exception as e:  # noqa: BLE001 — что бы ни сломалось, лицо не должно утечь
                 img[:] = 0
+                info = None
                 covered, faces_n, now = True, 0, time.monotonic()
                 self.error.emit(f"Ошибка обработки, кадр закрыт: {e}")
 
@@ -878,7 +919,7 @@ class Worker(QThread):
                 vcam = None
                 self.vcam_state.emit(False, "")
             snap, self.snapshot_to = self.snapshot_to, None
-            sent = sender.submit(output, img, vcam, self.mirror, snap)
+            sent = sender.submit(output, img, info, vcam, self.mirror, snap)
 
             dt = now - t_prev
             t_prev = now
@@ -1456,6 +1497,9 @@ class Main(QMainWindow):
         mb.addWidget(self.match_color)
         self.keep_mouth = ToggleRow("Свой рот", True, "Когда говорите, видны настоящие губы изнутри и зубы — выглядит живее.")
         mb.addWidget(self.keep_mouth)
+        self.hide_head = ToggleRow("Прятать голову при повороте", False,
+                                   "В профиль под чужим лицом размывается вся голова: волосы, ухо, затылок.")
+        mb.addWidget(self.hide_head)
         self.feather = SliderRow("Мягкость края", 0, 100, 50, lambda v: f"{v}%")
         mb.addWidget(self.feather)
         s.addWidget(self.media_box)
@@ -1564,6 +1608,7 @@ class Main(QMainWindow):
         self.rotate.toggle.toggled.connect(lambda v: setattr(self.worker, "rotate", v))
         self.match_color.toggle.toggled.connect(lambda v: setattr(self.worker, "match_color", v))
         self.keep_mouth.toggle.toggled.connect(lambda v: setattr(self.worker, "keep_mouth", v))
+        self.hide_head.toggle.toggled.connect(lambda v: setattr(self.worker, "hide_head", v))
         self.feather.slider.valueChanged.connect(lambda v: setattr(self.worker, "feather", v / 100))
         self.gallery.edit_clicked.connect(self.edit_mask)
         for key, row in self.fx_rows.items():
@@ -1607,6 +1652,9 @@ class Main(QMainWindow):
         self.low_light.toggle.setChecked(st.value("low_light", False, type=bool))
         self.low_light.toggle.set_knob(1.0 if self.low_light.toggle.isChecked() else 0.0)
         w.low_light = self.low_light.toggle.isChecked()
+        self.hide_head.toggle.setChecked(st.value("hide_head", False, type=bool))
+        self.hide_head.toggle.set_knob(1.0 if self.hide_head.toggle.isChecked() else 0.0)
+        w.hide_head = self.hide_head.toggle.isChecked()
 
         cam = st.value("camera", "")
         i = next((n for n, (_, name) in enumerate(self.cams) if name == cam), 0)
@@ -1666,6 +1714,7 @@ class Main(QMainWindow):
         if self.cams:
             st.setValue("camera", self.cams[self.cam.currentIndex()][1])
         st.setValue("vcam", self.vcam.toggle.isChecked())
+        st.setValue("hide_head", self.hide_head.toggle.isChecked())
         st.setValue("low_light", self.low_light.toggle.isChecked())
 
     # ── свои маски ──
@@ -1937,7 +1986,7 @@ class Main(QMainWindow):
             "Картинка, GIF или видео встанет на место лица. Файл можно перетащить в окно или вставить Ctrl+V. "
             "Двойной щелчок по маске — обрезать. PNG с прозрачностью ложится без фона.")
         self.rotate.setVisible(media)
-        for row in (self.match_color, self.keep_mouth, self.feather):
+        for row in (self.match_color, self.keep_mouth, self.hide_head, self.feather):
             row.setVisible(swap)
         self.strength.setVisible(not media and not swap)
         self.strength.setEnabled(mode in ("blur", "pixel"))

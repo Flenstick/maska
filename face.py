@@ -345,7 +345,11 @@ def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=
         inside = cv2.resize(inside_q, (rw, rh), interpolation=cv2.INTER_NEAREST)
     else:
         inside = inside_q
-    warped = cv2.remap(source.img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    # фото, уже перекрашенное под кадр на прошлых кадрах, натягиваем сразу — второй раз remap не нужен
+    st = state if state is not None else {}
+    done = st.get("recolored") if match_color else None
+    base = done[2] if done is not None and done[0] is source else source.img
+    warped = cv2.remap(base, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     roi = frame[y0:y1, x0:x1]
     outside = (inside == 0).view(np.uint8)
     cv2.copyTo(roi, outside, warped)  # вне сетки — кадр, иначе размытый край маски затянет туда угол фото
@@ -363,13 +367,15 @@ def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=
     if match_color:
         # цвет сравниваем по маленьким копиям; перекрашивается само фото и только когда свет заметно сменился,
         # а между кадрами поправка сглаживается — так дешевле и лицо не мерцает от шума камеры
-        st = state if state is not None else {}
         st["n"] = tick = st.get("n", -1) + 1
         params = None
         if tick % 3 == 0 or "color" not in st:  # свет меняется медленно — сверяем цвет раз в три кадра
             core = _shrink(mask, max(1, int(size * 0.02)))
-            params = color_stats(cv2.resize(warped, (sw, sh), interpolation=cv2.INTER_LINEAR),
-                                 cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_LINEAR), core)
+            # исходное фото натягиваем в маленьком размере — для сравнения цвета этого хватает
+            small_src = cv2.remap(source.img, cv2.resize(mx, (sw, sh), interpolation=cv2.INTER_LINEAR),
+                                  cv2.resize(my, (sw, sh), interpolation=cv2.INTER_LINEAR), cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REPLICATE)
+            params = color_stats(small_src, cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_LINEAR), core)
         elif st["color"][0] is source:
             params = st["color"][1]
         if params is not None:
@@ -381,8 +387,9 @@ def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=
             if (done is None or done[0] is not source
                     or np.abs(done[1][:3] - params[:3]).max() > 1.5 or np.abs(done[1][3:] - params[3:]).max() > 0.02):
                 done = st["recolored"] = (source, params, recolor(source.img, params))
-            warped = cv2.remap(done[2], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            cv2.copyTo(roi, outside, warped)
+            if done[2] is not base:  # перекрасили только что — натягиваем новое
+                warped = cv2.remap(done[2], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                cv2.copyTo(roi, outside, warped)
     # мягкий край: сначала сжимаем, потом размываем — шов уходит внутрь лица, а не на фон
     f = 0.01 + feather * 0.05
     soft = _shrink(mask, max(1, int(size * f * 0.6)))
