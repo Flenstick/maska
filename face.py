@@ -78,23 +78,24 @@ def hide_head(frame, pts, amount, side):
     x1, y1 = pts.max(0)
     fh = float(y1 - y0)
     side = float(np.clip(side, -1.5, 1.5))
-    cx = (x0 + x1) / 2 - side * fh * 0.22
-    cy = (y0 + y1) / 2 - fh * 0.12
-    ax, ay = fh * (0.62 + abs(side) * 0.12), fh * 0.8
+    # эллипс с запасом во все стороны: сетка в профиль сжимается, а голова — нет (макушка, нос, затылок)
+    cx = (x0 + x1) / 2 - side * fh * 0.12
+    cy = (y0 + y1) / 2 - fh * 0.18
+    ax, ay = fh * (0.75 + abs(side) * 0.18), fh * 0.98
     bx0, by0 = int(max(0, cx - ax)), int(max(0, cy - ay))
     bx1, by1 = int(min(w, cx + ax)), int(min(h, cy + ay))
     if bx1 - bx0 < 8 or by1 - by0 < 8:
         return
     roi = frame[by0:by1, bx0:bx1]
     rh, rw = roi.shape[:2]
-    sw, sh = max(2, rw // 14), max(2, rh // 14)
-    blur = cv2.GaussianBlur(cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA), (0, 0), 1.2)
+    sw, sh = max(2, rw // 24), max(2, rh // 24)  # размытие сильное — черты (очки, нос, брови) не угадываются
+    blur = cv2.GaussianBlur(cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA), (0, 0), 1.5)
     blur = cv2.resize(blur, (rw, rh), interpolation=cv2.INTER_LINEAR)
     m = np.zeros((sh * 4, sw * 4), np.float32)  # край эллипса — в уменьшенном виде, он всё равно мягкий
     kx, ky = sw * 4 / rw, sh * 4 / rh
     cv2.ellipse(m, (round((cx - bx0) * kx), round((cy - by0) * ky)), (round(ax * kx * 0.92), round(ay * ky * 0.92)),
                 0, 0, 360, float(amount), -1, cv2.LINE_AA)
-    m = cv2.GaussianBlur(m, (0, 0), max(1.0, sw * 0.3))
+    m = cv2.GaussianBlur(m, (0, 0), max(1.0, sw * 4 * 0.06))
     m = cv2.resize(m, (rw, rh), interpolation=cv2.INTER_LINEAR)
     roi[:] = cv2.blendLinear(blur, roi, m, 1.0 - m)
 

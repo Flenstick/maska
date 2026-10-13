@@ -501,9 +501,8 @@ def open_vcam(w, h):
     return pyvirtualcam.Camera(w, h, 60, fmt=pyvirtualcam.PixelFormat.BGR)
 
 
-# поворот головы (face.turn): дальше TURN_HIDE под лицом размывается вся голова, дальше TURN_PROFILE — профиль,
-# подменять нечего, голова только размыта
-TURN_HIDE, TURN_PROFILE = 0.35, 1.0
+# поворот головы (face.turn), начиная с которого под чужим лицом размывается вся голова
+TURN_HIDE = 0.3
 
 
 class Grabber(threading.Thread):
@@ -729,15 +728,11 @@ class Worker(QThread):
                     pts = t["pts"]
                     turn = face.turn(pts) if pts is not None else 0.0
                     if pts is not None and abs(turn) > TURN_HIDE:
-                        # голова повёрнута: сетка закрывает только видимую половину лица — остальную голову
-                        # (щёку, ухо, волосы) размываем, а в профиль подменять уже нечего — только размытие
-                        face.hide_head(img, pts, min(1.0, (abs(turn) - TURN_HIDE) / 0.3), turn)
-                    # с запасом в обе стороны, чтобы на границе профиля лицо не мигало то фото, то размытием
-                    st = t["face"]
-                    st["profile"] = profile = pts is not None and abs(turn) > (
-                        TURN_PROFILE - 0.15 if st.get("profile") else TURN_PROFILE)
-                    if not profile and (pts is None or not face.swap_face(
-                            img, pts, source, self.feather, self.match_color, self.keep_mouth, t["face"])):
+                        # голова повёрнута: чужое лицо закрывает только видимую половину — остальную голову
+                        # (щёку, ухо, волосы, профиль) размываем под ним, а само лицо остаётся
+                        face.hide_head(img, pts, min(1.0, (abs(turn) - TURN_HIDE) / 0.25), turn)
+                    if pts is None or not face.swap_face(img, pts, source, self.feather, self.match_color,
+                                                         self.keep_mouth, t["face"]):
                         # сетка не легла (рука у лица, лицо мелкое) — прячем размытием, как обычно
                         apply_mask(img, [t["rect"]], "blur", 80, self.pad + min(0.6, t["lost"] * 0.4), True)
                 mode = "off"
