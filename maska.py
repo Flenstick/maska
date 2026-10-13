@@ -33,7 +33,7 @@ from PyQt6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QIcon, QIm
 from PyQt6.QtWidgets import (QAbstractButton, QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
                              QMainWindow, QMenu, QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget)
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 IS_WIN = sys.platform == "win32"
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # в сборке PyInstaller — папка распаковки
 MODEL = APP_DIR / "models/face_detection_yunet_2023mar.onnx"
