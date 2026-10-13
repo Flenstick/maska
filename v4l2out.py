@@ -41,3 +41,27 @@ class Camera:
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
+
+
+VIDIOC_S_CTRL = 0xC008561C             # _IOWR('V', 28, struct v4l2_control)
+V4L2_CID_EXPOSURE_AUTO_PRIORITY = 0x009A0903
+
+
+def set_control(device, cid, value):
+    """Задаёт настройку камеры (как v4l2-ctl -c). False — камера её не знает или узел не открылся."""
+    try:
+        fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        fcntl.ioctl(fd, VIDIOC_S_CTRL, bytearray(struct.pack("Ii", cid, value)))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def keep_framerate(device, on):
+    """on — частота кадров постоянная; иначе в темноте камера сама удлиняет выдержку и роняет кадры (до 5–15 fps)."""
+    return set_control(device, V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0 if on else 1)

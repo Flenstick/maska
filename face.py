@@ -58,6 +58,47 @@ def blink(pts, state):
     return out
 
 
+def turn(pts):
+    """Поворот головы вбок по точкам: 0 — анфас, ~1 — пол-оборота, больше 1 — профиль; знак — куда смотрит нос
+    по x кадра. Меряем, где кончик носа лежит между краями щёк: у анфаса посередине, в профиль — за краем."""
+    a, b, nose = pts[234].astype(np.float64), pts[454].astype(np.float64), pts[1].astype(np.float64)
+    axis = b - a
+    t = float(np.dot(nose - a, axis) / (np.dot(axis, axis) + 1e-6)) - 0.5
+    return 2 * t * (1.0 if axis[0] >= 0 else -1.0)
+
+
+def hide_head(frame, pts, amount, side):
+    """Сильно размывает всю голову — волосы, уши, щёку и затылок за краем сетки.
+
+    При повороте сетка покрывает только видимую половину лица, а остальное узнаваемо — его и прячем
+    под заменённым лицом. amount 0..1 — насколько, side — куда смотрит нос (затылок с другой стороны).
+    """
+    h, w = frame.shape[:2]
+    x0, y0 = pts.min(0)
+    x1, y1 = pts.max(0)
+    fh = float(y1 - y0)
+    side = float(np.clip(side, -1.5, 1.5))
+    cx = (x0 + x1) / 2 - side * fh * 0.22
+    cy = (y0 + y1) / 2 - fh * 0.12
+    ax, ay = fh * (0.62 + abs(side) * 0.12), fh * 0.8
+    bx0, by0 = int(max(0, cx - ax)), int(max(0, cy - ay))
+    bx1, by1 = int(min(w, cx + ax)), int(min(h, cy + ay))
+    if bx1 - bx0 < 8 or by1 - by0 < 8:
+        return
+    roi = frame[by0:by1, bx0:bx1]
+    rh, rw = roi.shape[:2]
+    sw, sh = max(2, rw // 14), max(2, rh // 14)
+    blur = cv2.GaussianBlur(cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA), (0, 0), 1.2)
+    blur = cv2.resize(blur, (rw, rh), interpolation=cv2.INTER_LINEAR)
+    m = np.zeros((sh * 4, sw * 4), np.float32)  # край эллипса — в уменьшенном виде, он всё равно мягкий
+    kx, ky = sw * 4 / rw, sh * 4 / rh
+    cv2.ellipse(m, (round((cx - bx0) * kx), round((cy - by0) * ky)), (round(ax * kx * 0.92), round(ay * ky * 0.92)),
+                0, 0, 360, float(amount), -1, cv2.LINE_AA)
+    m = cv2.GaussianBlur(m, (0, 0), max(1.0, sw * 0.3))
+    m = cv2.resize(m, (rw, rh), interpolation=cv2.INTER_LINEAR)
+    roi[:] = cv2.blendLinear(blur, roi, m, 1.0 - m)
+
+
 class OneEuro:
     """Фильтр One Euro: на месте сглаживает сильно (дрожь уходит), при движении — слабо (маска не отстаёт).
 
@@ -179,9 +220,15 @@ class FaceSource:
         refined = self._refine(img, mesh, pts)
         if refined is not None:
             pts = refined
-        self.img = img
-        self.pts = pts
         self.tris = self._delaunay(pts, img.shape)
+        # от фото нужна только область лица с запасом — её дешевле перекрашивать под свет в кадре
+        h, w = img.shape[:2]
+        (x0, y0), (x1, y1) = pts.min(0), pts.max(0)
+        mx, my = (x1 - x0) * 0.1 + 4, (y1 - y0) * 0.1 + 4
+        x0, y0 = int(max(0, x0 - mx)), int(max(0, y0 - my))
+        x1, y1 = int(min(w, x1 + mx)), int(min(h, y1 + my))
+        self.img = np.ascontiguousarray(img[y0:y1, x0:x1])
+        self.pts = (pts - (x0, y0)).astype(np.float32)
 
     @staticmethod
     def _refine(img, mesh, pts):
@@ -218,19 +265,42 @@ def _affines(src, dst):
     return np.transpose(m, (0, 2, 1))               # (T, 2, 3)
 
 
-def color_transfer(src, dst, mask):
-    """Среднее и разброс цвета src (LAB) приводятся к dst внутри маски — таблицей LUT, это быстро."""
+def color_stats(src, dst, mask):
+    """Как привести цвет src к dst внутри маски (LAB): (сдвиг, множитель) по каналам; None — маска пустая."""
     m8 = (mask > 0.5).astype(np.uint8)
     if cv2.countNonZero(m8) < 50:
-        return src
-    s = cv2.cvtColor(src, cv2.COLOR_BGR2LAB)
-    d = cv2.cvtColor(dst, cv2.COLOR_BGR2LAB)
-    sm, ss = (v.ravel() for v in cv2.meanStdDev(s, mask=m8))
-    dm, ds = (v.ravel() for v in cv2.meanStdDev(d, mask=m8))
+        return None
+    sm, ss = (v.ravel() for v in cv2.meanStdDev(cv2.cvtColor(src, cv2.COLOR_BGR2LAB), mask=m8))
+    dm, ds = (v.ravel() for v in cv2.meanStdDev(cv2.cvtColor(dst, cv2.COLOR_BGR2LAB), mask=m8))
     ratio = np.clip((ds + 1e-3) / (ss + 1e-3), 0.6, 1.6)
-    x = np.arange(256, dtype=np.float32)[:, None]
-    lut = np.clip((x - sm) * ratio + dm, 0, 255).astype(np.uint8).reshape(256, 1, 3)
-    return cv2.cvtColor(cv2.LUT(s, lut), cv2.COLOR_LAB2BGR)
+    return np.concatenate([dm - sm * ratio, ratio])
+
+
+def recolor(img, params):
+    """Перекрашивает картинку в LAB таблицей LUT по параметрам color_stats."""
+    x = np.arange(256, dtype=np.float64)[:, None]
+    lut = np.clip(x * params[3:] + params[:3], 0, 255).astype(np.uint8).reshape(256, 1, 3)
+    return cv2.cvtColor(cv2.LUT(cv2.cvtColor(img, cv2.COLOR_BGR2LAB), lut), cv2.COLOR_LAB2BGR)
+
+
+_GRIDS = {}
+
+
+def _grid(qh, qw, q):
+    """Координаты пикселей карты: одна большая сетка на шаг q, из неё берётся угол нужного размера."""
+    g = _GRIDS.get(q)
+    if g is None or g[0].shape[0] < qh or g[0].shape[1] < qw:
+        gh, gw = max(qh, 64) * 3 // 2, max(qw, 64) * 3 // 2
+        if g is not None:
+            gh, gw = max(gh, g[0].shape[0]), max(gw, g[0].shape[1])
+        ys, xs = np.mgrid[0:gh, 0:gw].astype(np.float32) * q
+        g = _GRIDS[q] = ys, xs
+    return g[0][:qh, :qw], g[1][:qh, :qw]
+
+
+def _shrink(mask, r):
+    """Эрозия квадратом радиуса r — то же, что r проходов ядром 3×3, но одним проходом."""
+    return cv2.erode(mask, np.ones((2 * r + 1, 2 * r + 1), np.uint8)) if r > 0 else mask
 
 
 def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=True, state=None):
@@ -249,9 +319,9 @@ def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=
         return False
     local = dst_pts - (x0, y0)
     tris = source.tris
-    # карта «какой треугольник в каждом пикселе» (0 — вне лица); у крупного лица считаем её в половинном
-    # разрешении и растягиваем — внутри треугольника карта линейная, разницы не видно, а быстрее в 3–4 раза
-    q = 2 if rw * rh > 30000 else 1
+    # карта «какой треугольник в каждом пикселе» (0 — вне лица); у крупного лица считаем её в уменьшенном
+    # разрешении и растягиваем — внутри треугольника карта линейная, разницы не видно, а быстрее в разы
+    q = max(1, int(max(rw, rh) / 180))
     qw, qh = (rw + q - 1) // q, (rh + q - 1) // q
     idx = np.zeros((qh, qw), np.int32)
     corners = np.round(local / q).astype(np.int32)[tris]
@@ -263,32 +333,60 @@ def swap_face(frame, dst_pts, source, feather=0.5, match_color=True, keep_mouth=
         cv2.fillConvexPoly(idx, corners[n], int(n) + 1)
     aff = _affines(source.pts[tris].astype(np.float64), local[tris].astype(np.float64))
     aff = np.concatenate([np.zeros((1, 2, 3)), aff]).astype(np.float32).reshape(-1, 6)
-    ys, xs = np.mgrid[0:qh, 0:qw].astype(np.float32) * q
+    ys, xs = _grid(qh, qw, q)
     a = aff[idx]                                     # (qh, qw, 6)
     mx = a[..., 0] * xs + a[..., 1] * ys + a[..., 2]
     my = a[..., 3] * xs + a[..., 4] * ys + a[..., 5]
+    inside_q = (idx > 0).astype(np.uint8)
     if q > 1:
         mx = cv2.resize(mx, (rw, rh), interpolation=cv2.INTER_LINEAR)
         my = cv2.resize(my, (rw, rh), interpolation=cv2.INTER_LINEAR)
-        idx = cv2.resize(idx.astype(np.float32), (rw, rh), interpolation=cv2.INTER_NEAREST)
+        inside = cv2.resize(inside_q, (rw, rh), interpolation=cv2.INTER_NEAREST)
+    else:
+        inside = inside_q
     warped = cv2.remap(source.img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     roi = frame[y0:y1, x0:x1]
-    outside = idx == 0
-    warped[outside] = roi[outside]  # вне сетки — кадр, иначе размытый край маски затянет туда угол фото
+    outside = (inside == 0).view(np.uint8)
+    cv2.copyTo(roi, outside, warped)  # вне сетки — кадр, иначе размытый край маски затянет туда угол фото
 
-    mask = np.zeros((rh, rw), np.float32)
-    cv2.fillPoly(mask, [np.round(local[FACE_OVAL]).astype(np.int32)], 1.0)
-    mask *= (idx > 0)
+    # маска, её мягкий край и подгонка цвета — в уменьшенном виде: край всё равно размыт, а это в разы быстрее
+    k = min(1.0, 160 / max(rw, rh))
+    sw, sh = max(1, round(rw * k)), max(1, round(rh * k))
+    small = local * (sw / rw, sh / rh)
+    mask = np.zeros((sh, sw), np.float32)
+    cv2.fillPoly(mask, [np.round(small[FACE_OVAL]).astype(np.int32)], 1.0)
+    mask *= cv2.resize(inside_q, (sw, sh), interpolation=cv2.INTER_NEAREST)
     if keep_mouth:
-        cv2.fillPoly(mask, [np.round(local[INNER_LIPS]).astype(np.int32)], 0.0)
-    size = max(rw, rh)
-    core = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=max(1, int(size * 0.02)))
+        cv2.fillPoly(mask, [np.round(small[INNER_LIPS]).astype(np.int32)], 0.0)
+    size = max(sw, sh)
     if match_color:
-        warped = color_transfer(warped, roi, core)
+        # цвет сравниваем по маленьким копиям; перекрашивается само фото и только когда свет заметно сменился,
+        # а между кадрами поправка сглаживается — так дешевле и лицо не мерцает от шума камеры
+        st = state if state is not None else {}
+        st["n"] = tick = st.get("n", -1) + 1
+        params = None
+        if tick % 3 == 0 or "color" not in st:  # свет меняется медленно — сверяем цвет раз в три кадра
+            core = _shrink(mask, max(1, int(size * 0.02)))
+            params = color_stats(cv2.resize(warped, (sw, sh), interpolation=cv2.INTER_LINEAR),
+                                 cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_LINEAR), core)
+        elif st["color"][0] is source:
+            params = st["color"][1]
+        if params is not None:
+            prev = st.get("color")
+            if prev is not None and prev[0] is source:
+                params = prev[1] + (params - prev[1]) * 0.25
+            st["color"] = (source, params)
+            done = st.get("recolored")
+            if (done is None or done[0] is not source
+                    or np.abs(done[1][:3] - params[:3]).max() > 1.5 or np.abs(done[1][3:] - params[3:]).max() > 0.02):
+                done = st["recolored"] = (source, params, recolor(source.img, params))
+            warped = cv2.remap(done[2], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            cv2.copyTo(roi, outside, warped)
     # мягкий край: сначала сжимаем, потом размываем — шов уходит внутрь лица, а не на фон
-    k = 0.01 + feather * 0.05
-    soft = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=max(1, int(size * k * 0.6)))
-    soft = cv2.GaussianBlur(soft, (0, 0), max(1.0, size * k))
+    f = 0.01 + feather * 0.05
+    soft = _shrink(mask, max(1, int(size * f * 0.6)))
+    soft = cv2.GaussianBlur(soft, (0, 0), max(0.6, size * f))
+    soft = cv2.resize(soft, (rw, rh), interpolation=cv2.INTER_LINEAR)
     roi[:] = cv2.blendLinear(warped, roi, soft, 1.0 - soft)
     return True
 

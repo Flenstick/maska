@@ -12,8 +12,10 @@ import os
 import shutil
 import tempfile
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -198,10 +200,14 @@ def apply_mask(frame, boxes, mode, strength, pad, oval):
         if not oval:
             roi[:] = eff
             continue
-        m = np.zeros((rh, rw), np.float32)
-        cv2.ellipse(m, (rw // 2, rh // 2), (int(rw * 0.46), int(rh * 0.46)), 0, 0, 360, 1.0, -1)
-        m = cv2.GaussianBlur(m, (0, 0), max(1.0, min(rw, rh) * 0.04))[..., None]
-        roi[:] = (eff * m + roi * (1.0 - m)).astype(np.uint8)
+        # мягкий овал считаем в маленьком виде и растягиваем — край размыт, разницы не видно, а быстрее в разы
+        k = min(1.0, 96 / max(rw, rh))
+        sw, sh = max(4, round(rw * k)), max(4, round(rh * k))
+        m = np.zeros((sh, sw), np.float32)
+        cv2.ellipse(m, (sw // 2, sh // 2), (int(sw * 0.46), int(sh * 0.46)), 0, 0, 360, 1.0, -1, cv2.LINE_AA)
+        m = cv2.GaussianBlur(m, (0, 0), max(0.5, min(sw, sh) * 0.04))
+        m = cv2.resize(m, (rw, rh), interpolation=cv2.INTER_LINEAR)
+        roi[:] = cv2.blendLinear(eff, roi, m, 1.0 - m)
 
 
 # ───────────────────────────── свои маски ─────────────────────────────
@@ -489,10 +495,73 @@ def open_vcam(w, h):
                 import pyvirtualcam
             except ImportError:
                 raise
-            return pyvirtualcam.Camera(w, h, 30, fmt=pyvirtualcam.PixelFormat.BGR, backend="v4l2loopback",
+            return pyvirtualcam.Camera(w, h, 60, fmt=pyvirtualcam.PixelFormat.BGR, backend="v4l2loopback",
                                        device=loopback_device())
     import pyvirtualcam
-    return pyvirtualcam.Camera(w, h, 30, fmt=pyvirtualcam.PixelFormat.BGR)
+    return pyvirtualcam.Camera(w, h, 60, fmt=pyvirtualcam.PixelFormat.BGR)
+
+
+# поворот головы (face.turn): дальше TURN_HIDE под лицом размывается вся голова, дальше TURN_PROFILE — профиль,
+# подменять нечего, голова только размыта
+TURN_HIDE, TURN_PROFILE = 0.35, 1.0
+
+
+class Grabber(threading.Thread):
+    """Читает камеру в своём потоке: распаковка MJPG не тормозит обработку, а она всегда берёт свежий кадр.
+
+    Тёмный кадр (камера держит частоту, и выдержки не хватает) осветляется гаммой. Из видеофайла
+    (MASKA_SOURCE) кадры не пропускаются — поток ждёт, пока обработка заберёт прошлый, и крутит файл по кругу.
+    """
+
+    def __init__(self, cap, from_file):
+        super().__init__(daemon=True)
+        self.cap, self.from_file = cap, from_file
+        self.cond = threading.Condition()
+        self.img, self.alive, self.running = None, True, True
+        self.gamma, self.lut, self.n = 1.0, None, 0
+
+    def lift(self, img):
+        self.n += 1
+        if self.n % 6 == 1:  # яркость меняется медленно — мерить каждый кадр незачем
+            mean = float(cv2.resize(img, (64, 36), interpolation=cv2.INTER_AREA).mean())
+            want = 1.0 if mean >= 80 else max(0.45, math.log(95 / 255) / math.log(max(mean, 6) / 255))
+            gamma = self.gamma + (want - self.gamma) * 0.3
+            if abs(gamma - self.gamma) > 0.01 or (self.lut is None and gamma < 0.97):
+                self.gamma = gamma
+                self.lut = (None if gamma > 0.97 else
+                            np.clip((np.arange(256) / 255.0) ** gamma * 255, 0, 255).astype(np.uint8))
+        return img if self.lut is None else cv2.LUT(img, self.lut)
+
+    def run(self):
+        while self.running:
+            ok, img = self.cap.read() if self.cap.isOpened() else (False, None)
+            if not ok and self.from_file and self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # файл кончился — по кругу
+                continue
+            if ok and not self.from_file:
+                img = self.lift(img)
+            with self.cond:
+                while self.from_file and self.running and self.img is not None:
+                    self.cond.wait(0.1)
+                self.img, self.alive = (img, True) if ok else (None, False)
+                self.cond.notify_all()
+            if not ok:
+                return
+
+    def get(self, timeout=1.0):
+        """Свежий кадр; None — кадра пока нет или камера отвалилась (тогда alive == False)."""
+        with self.cond:
+            self.cond.wait_for(lambda: self.img is not None or not self.alive, timeout)
+            img, self.img = self.img, None
+            self.cond.notify_all()
+            return img
+
+    def stop(self):
+        self.running = False
+        with self.cond:
+            self.cond.notify_all()
+        self.join(3)
+        self.cap.release()
 
 
 class Worker(QThread):
@@ -523,6 +592,7 @@ class Worker(QThread):
         self.bg_mode = "off"     # фон: off, blur, media, green
         self.bg_spec = None      # картинка/GIF/видео для фона (путь, правки)
         self.bg_blur = 60
+        self.low_light = False   # True — камере можно ронять кадры в темноте ради яркости
         self.snapshot_to = None
         self._restart = False
         self._running = True
@@ -538,29 +608,195 @@ class Worker(QThread):
     def open_cam(self):
         if os.environ.get("MASKA_SOURCE"):  # видеофайл вместо камеры — для проверки и скриншотов
             return cv2.VideoCapture(os.environ["MASKA_SOURCE"])
+        if not IS_WIN:  # иначе в полутьме вебка сама опускает кадры до 5–15 в секунду ради выдержки
+            import v4l2out
+            v4l2out.keep_framerate(f"/dev/video{self.device}", not self.low_light)
         cap = cv2.VideoCapture(self.device, cv2.CAP_DSHOW if IS_WIN else cv2.CAP_V4L2)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_FPS, 60)  # сколько камера умеет: не умеет 60 — драйвер даст ближайшее (обычно 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
+    def set_low_light(self, on):
+        """Настройка камеры меняется на ходу — переоткрывать её (и рвать картинку в Discord) не нужно."""
+        self.low_light = on
+        if not IS_WIN and not os.environ.get("MASKA_SOURCE"):
+            import v4l2out
+            v4l2out.keep_framerate(f"/dev/video{self.device}", not on)
+
+    def start_grabber(self):
+        g = Grabber(self.open_cam(), bool(os.environ.get("MASKA_SOURCE")))
+        g.start()
+        return g
+
     def run(self):
+        """Конвейер из трёх потоков, чтобы держать частоту камеры (до 60 fps).
+
+        Grabber читает и распаковывает кадры. Пока здесь рисуется кадр N (маски, лицо, фон), в пуле уже
+        разбирается кадр N+1: детектор лиц и сегментация фона идут параллельно, потом сетка лица.
+        Готовый кадр уходит в виртуальную камеру и превью тоже в своём потоке.
+        """
+        # три потока конвейера работают одновременно; если каждая операция OpenCV ещё и сама расползается
+        # на все ядра, потоки толкаются и выходит медленнее — по 4 на операцию быстрее всего (замер: +30 %)
+        cv2.setNumThreads(max(2, min(4, (os.cpu_count() or 4) // 2)))
         detector = cv2.FaceDetectorYN.create(str(MODEL), "", (320, 320), 0.6, 0.3, 50)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         tracker = Tracker()
-        cap = self.open_cam()
+        grab = self.start_grabber()
+        analyst, helper, sender = (ThreadPoolExecutor(1) for _ in range(3))
+        job = sent = None  # разбор следующего кадра и вывод прошлого
         vcam = None
         media, media_spec, media_t0 = None, None, 0.0
         source, face_spec = None, None
         segmenter, bg_media, bg_spec, bg_t0 = None, None, None, 0.0
+        bg_cache = (None, None, None)  # (кадр фона, размер, готовый фон) — картинка-фон не пересчитывается
         try:
             mesh = face.FaceMesh(MESH_MODEL)
         except Exception as e:  # noqa: BLE001 — без сетки просто не будет проверки находок и замены лица
             mesh = None
             self.error.emit(f"Сетка лица не загрузилась: {e}")
+
+        def analyze(img, want_pts):
+            """Где лица, их точки и где человек — по чистому кадру, до любой обработки."""
+            nonlocal tracker, segmenter
+            try:
+                h, w = img.shape[:2]
+                scale = min(1.0, 640 / w)
+                small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale < 1 else img
+                seg_job = None
+                if self.bg_mode != "off":
+                    if segmenter is None:
+                        try:
+                            segmenter = background.Segmenter(SEG_MODEL)
+                        except Exception as e:  # noqa: BLE001 — без модели фон просто не меняем
+                            self.bg_mode = "off"
+                            self.error.emit(f"Замена фона недоступна: {e}")
+                    if segmenter is not None:
+                        seg_job = helper.submit(segmenter.mask, small)
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                detector.setInputSize((small.shape[1], small.shape[0]))
+                _, faces = detector.detect(small)
+                if faces is None:  # тёмный или пересвеченный кадр — второй проход с выравниванием яркости
+                    eq = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+                    _, faces = detector.detect(eq)
+                # пятое число — наклон головы по линии глаз (точки 4–7 у YuNet)
+                boxes = [] if faces is None else [[float(v) for v in f[:4]] +
+                                                   [math.degrees(math.atan2(f[7] - f[5], f[6] - f[4]))]
+                                                   for f in faces]
+                scores = [] if faces is None else [float(f[14]) for f in faces]
+                now = time.monotonic()
+                tracks = tracker.update(gray, boxes, now, scores)
+                # находки, в которых детектор не уверен (дверь, рука, узор на обоях), проверяем сеткой лица:
+                # у настоящего лица она уверена, у всего остального — нет
+                for t in tracks:
+                    if not t["ok"]:
+                        if mesh is None or mesh.is_face(img, [v / scale for v in t["box"][:4]], t["box"][4]):
+                            t["ok"] = True
+                        else:
+                            t["fake"] += 1
+                live = []
+                for t in tracks:
+                    if not t["ok"]:
+                        continue
+                    pts = (face.track_points(mesh, img, [v / scale for v in t["box"][:4]], t["box"][4],
+                                             t.setdefault("mesh", {}), now) if want_pts and mesh else None)
+                    # снимок дорожки: пока этот кадр рисуется, трекер уже правит её для следующего
+                    live.append({"rect": [v / scale for v in t["box"][:4]], "angle": t["box"][4],
+                                 "lost": now - t["seen"], "pts": pts,
+                                 "face": t.setdefault("face", {}), "fx": t.setdefault("fx", {})})
+                return {"now": now, "live": live, "seg": seg_job.result() if seg_job else None}
+            except Exception as e:  # noqa: BLE001 — кадр всё равно закроется при отрисовке
+                tracker = Tracker()  # сбрасываем дорожки, чтобы одна сломанная не держала кадр чёрным
+                return e
+
+        def render(img, info):
+            """Рисует маски, лицо, фон и эффекты прямо в img. Возвращает (лиц, кадр закрыт целиком)."""
+            nonlocal bg_cache
+            h, w = img.shape[:2]
+            now, live, seg_mask = info["now"], info["live"], info["seg"]
+            covered = False
+            mode = self.mode
+            mframe = None
+            if mode == "face" and source is None:
+                mode = "blur"  # фото не выбрано или на нём нет лица — пока просто размываем
+            if mode == "face":
+                if self.failsafe and not live:
+                    covered = True
+                    apply_mask(img, [[0, 0, w, h]], "blur", 80, 0, False)
+                for t in live:
+                    pts = t["pts"]
+                    turn = face.turn(pts) if pts is not None else 0.0
+                    if pts is not None and abs(turn) > TURN_HIDE:
+                        # голова повёрнута: сетка закрывает только видимую половину лица — остальную голову
+                        # (щёку, ухо, волосы) размываем, а в профиль подменять уже нечего — только размытие
+                        face.hide_head(img, pts, min(1.0, (abs(turn) - TURN_HIDE) / 0.3), turn)
+                    # с запасом в обе стороны, чтобы на границе профиля лицо не мигало то фото, то размытием
+                    st = t["face"]
+                    st["profile"] = profile = pts is not None and abs(turn) > (
+                        TURN_PROFILE - 0.15 if st.get("profile") else TURN_PROFILE)
+                    if not profile and (pts is None or not face.swap_face(
+                            img, pts, source, self.feather, self.match_color, self.keep_mouth, t["face"])):
+                        # сетка не легла (рука у лица, лицо мелкое) — прячем размытием, как обычно
+                        apply_mask(img, [t["rect"]], "blur", 80, self.pad + min(0.6, t["lost"] * 0.4), True)
+                mode = "off"
+            if mode == "media":
+                if media is None:
+                    mode = "blur"  # маска не выбрана или не открылась — лицо всё равно прячем
+                else:
+                    mframe = media.frame(now - media_t0)
+            if mode != "off":
+                if self.failsafe and not live:
+                    covered = True
+                    if mframe is None:
+                        apply_mask(img, [[0, 0, w, h]], mode, max(self.strength, 70), 0, False)
+                    else:  # под маску с прозрачностью — чёрный фон, чтобы ничего не просвечивало
+                        img[:] = 0
+                        apply_media(img, [0, 0, w, h], mframe, media.alpha, 0, False, cover=not media.alpha)
+                for t in live:
+                    grow = min(0.6, t["lost"] * 0.4)  # чем дольше лицо не подтверждено, тем шире маска
+                    if mframe is None:
+                        apply_mask(img, [t["rect"]], mode, self.strength, self.pad + grow, self.oval)
+                    else:
+                        apply_media(img, t["rect"], mframe, media.alpha, self.pad + grow, self.oval,
+                                    t["angle"] if self.rotate else 0.0, cover=not media.alpha)
+            if seg_mask is not None and self.bg_mode != "off":
+                if self.bg_mode == "blur":
+                    bg = background.blurred(img, self.bg_blur)
+                elif self.bg_mode == "green":
+                    bg = np.empty_like(img)
+                    bg[:] = background.GREEN
+                elif bg_media is not None:
+                    bgf = bg_media.frame(now - bg_t0)
+                    if bg_cache[0] is not bgf or bg_cache[1] != (w, h):  # картинка не меняется — считаем раз
+                        a = bgf[..., 3:].astype(np.float32) / 255.0  # прозрачные места картинки-фона — чёрные
+                        bg_cache = (bgf, (w, h), background.cover((bgf[..., :3] * a).astype(np.uint8), w, h))
+                    bg = bg_cache[2]
+                else:
+                    bg = background.blurred(img, 60)  # фон не выбран — пока просто размываем
+                background.composite(img, seg_mask, bg)
+            if self.effects:
+                for t in live:
+                    if t["pts"] is not None:
+                        effects.apply(img, t["pts"], t["fx"], now, self.effects, self.effect_opts)
+            return len(live), covered
+
+        def output(img, vcam, mirror, snap):
+            if vcam is not None:
+                vcam.send(img)
+            if snap:
+                snap.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(snap), img)
+            h, w = img.shape[:2]
+            rgb = cv2.cvtColor(cv2.flip(img, 1) if mirror else img, cv2.COLOR_BGR2RGB)
+            self.frame.emit(QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy())
+
         t_prev, fps = time.monotonic(), 0.0
         while self._running:
+            ready = job.result() if job else None  # (кадр, разбор) — разбор шёл, пока рисовался прошлый
+            job = None
+            # всё, что трогает сетку лица, — только здесь, когда разбор кадра не идёт
             if self.media_spec != media_spec:
                 media_spec = self.media_spec
                 if media:
@@ -598,130 +834,43 @@ class Worker(QThread):
                         self.face_state.emit(str(e))
             if self._restart:
                 self._restart = False
-                cap.release()
-                cap = self.open_cam()
+                ready = None
+                grab.stop()
+                grab = self.start_grabber()
                 tracker = Tracker()
+                if sent:
+                    sent.result()
                 if vcam:
                     vcam.close()
                     vcam = None
-            ok, img = cap.read() if cap.isOpened() else (False, None)
-            if not ok and os.environ.get("MASKA_SOURCE") and cap.isOpened():
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # файл кончился — по кругу
-                continue
-            if not ok:
+
+            img = grab.get()
+            if img is None and not grab.alive:
                 self.error.emit("Камера не отвечает. Проверьте, не занята ли она другой программой.")
+                grab.stop()
                 self.msleep(500)
-                cap.release()
-                cap = self.open_cam()
+                grab = self.start_grabber()
+                tracker = Tracker()
+            elif img is not None:
+                want_pts = mesh is not None and bool(self.effects or (self.mode == "face" and source is not None))
+                job = analyst.submit(lambda im=img, wp=want_pts: (im, analyze(im, wp)))
+            if ready is None:
                 continue
 
+            img, info = ready
             h, w = img.shape[:2]
-            covered = False
             try:
-                scale = min(1.0, 640 / w)
-                small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale < 1 else img
-                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                detector.setInputSize((small.shape[1], small.shape[0]))
-                _, faces = detector.detect(small)
-                if faces is None:  # тёмный или пересвеченный кадр — второй проход с выравниванием яркости
-                    eq = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
-                    _, faces = detector.detect(eq)
-                # пятое число — наклон головы по линии глаз (точки 4–7 у YuNet)
-                boxes = [] if faces is None else [[float(v) for v in f[:4]] +
-                                                   [math.degrees(math.atan2(f[7] - f[5], f[6] - f[4]))]
-                                                   for f in faces]
-                scores = [] if faces is None else [float(f[14]) for f in faces]
-                now = time.monotonic()
-                tracks = tracker.update(gray, boxes, now, scores)
-                # находки, в которых детектор не уверен (дверь, рука, узор на обоях), проверяем сеткой лица:
-                # у настоящего лица она уверена, у всего остального — нет
-                for t in tracks:
-                    if not t["ok"]:
-                        if mesh is None or mesh.is_face(img, [v / scale for v in t["box"][:4]], t["box"][4]):
-                            t["ok"] = True
-                        else:
-                            t["fake"] += 1
-                live = [(t["box"], now - t["seen"]) for t in tracks if t["ok"]]
-                live_tracks = [t for t in tracks if t["ok"]]
-                faces_n = len(live)
-
-                mode = self.mode
-                mframe = None
-                # фон: человека вырезаем по чистому кадру, а подменяем фон уже после масок лица
-                seg_mask = None
-                if self.bg_mode != "off":
-                    if segmenter is None:
-                        try:
-                            segmenter = background.Segmenter(SEG_MODEL)
-                        except Exception as e:  # noqa: BLE001 — без модели фон просто не меняем
-                            self.bg_mode = "off"
-                            self.error.emit(f"Замена фона недоступна: {e}")
-                    if segmenter is not None:
-                        seg_mask = segmenter.mask(small)
-                # точки лица считаем по чистому кадру — до размытия и замены (нужны лицу и эффектам)
-                want_pts = mesh is not None and (self.effects or (mode == "face" and source is not None))
-                for t in live_tracks:
-                    t["pts"] = (face.track_points(mesh, img, [v / scale for v in t["box"][:4]], t["box"][4],
-                                                  t.setdefault("mesh", {}), now) if want_pts else None)
-                if mode == "face" and source is None:
-                    mode = "blur"  # фото не выбрано или на нём нет лица — пока просто размываем
-                if mode == "face":
-                    if self.failsafe and not live:
-                        covered = True
-                        apply_mask(img, [[0, 0, w, h]], "blur", 80, 0, False)
-                    for t in live_tracks:
-                        box, lost = t["box"], now - t["seen"]
-                        rect = [v / scale for v in box[:4]]
-                        pts = t["pts"]
-                        if pts is None or not face.swap_face(img, pts, source, self.feather, self.match_color,
-                                                             self.keep_mouth, t.setdefault("face", {})):
-                            # сетка не легла (поворот, рука у лица) — прячем размытием, как обычно
-                            apply_mask(img, [rect], "blur", 80, self.pad + min(0.6, lost * 0.4), True)
-                    mode = "off"
-                if mode == "media":
-                    if media is None:
-                        mode = "blur"  # маска не выбрана или не открылась — лицо всё равно прячем
-                    else:
-                        mframe = media.frame(now - media_t0)
-                if mode != "off":
-                    if self.failsafe and not live:
-                        covered = True
-                        if mframe is None:
-                            apply_mask(img, [[0, 0, w, h]], mode, max(self.strength, 70), 0, False)
-                        else:  # под маску с прозрачностью — чёрный фон, чтобы ничего не просвечивало
-                            img[:] = 0
-                            apply_media(img, [0, 0, w, h], mframe, media.alpha, 0, False, cover=not media.alpha)
-                    for box, lost in live:
-                        grow = min(0.6, lost * 0.4)  # чем дольше лицо не подтверждено, тем шире маска
-                        rect = [v / scale for v in box[:4]]
-                        if mframe is None:
-                            apply_mask(img, [rect], mode, self.strength, self.pad + grow, self.oval)
-                        else:
-                            apply_media(img, rect, mframe, media.alpha, self.pad + grow, self.oval,
-                                        box[4] if self.rotate else 0.0, cover=not media.alpha)
-                if seg_mask is not None:
-                    if self.bg_mode == "blur":
-                        bg = background.blurred(img, self.bg_blur)
-                    elif self.bg_mode == "green":
-                        bg = np.empty_like(img)
-                        bg[:] = background.GREEN
-                    elif bg_media is not None:
-                        bgf = bg_media.frame(now - bg_t0)
-                        a = bgf[..., 3:].astype(np.float32) / 255.0  # прозрачные места картинки-фона — чёрные
-                        bg = background.cover((bgf[..., :3] * a).astype(np.uint8), w, h)
-                    else:
-                        bg = background.blurred(img, 60)  # фон не выбран — пока просто размываем
-                    background.composite(img, seg_mask, bg)
-                if self.effects:
-                    for t in live_tracks:
-                        if t.get("pts") is not None:
-                            effects.apply(img, t["pts"], t.setdefault("fx", {}), now, self.effects, self.effect_opts)
+                if isinstance(info, Exception):
+                    raise info
+                faces_n, covered = render(img, info)
+                now = info["now"]
             except Exception as e:  # noqa: BLE001 — что бы ни сломалось, лицо не должно утечь
                 img[:] = 0
-                tracker = Tracker()  # сбрасываем дорожки, чтобы одна сломанная не держала кадр чёрным
                 covered, faces_n, now = True, 0, time.monotonic()
                 self.error.emit(f"Ошибка обработки, кадр закрыт: {e}")
 
+            if sent:
+                sent.result()  # прошлый кадр ещё уходит — ждём, иначе очередь вывода будет расти
             if self.want_vcam and vcam is None:
                 try:
                     vcam = open_vcam(w, h)
@@ -733,24 +882,21 @@ class Worker(QThread):
                 vcam.close()
                 vcam = None
                 self.vcam_state.emit(False, "")
-            if vcam is not None:
-                vcam.send(img)
-
-            if self.snapshot_to:
-                path, self.snapshot_to = self.snapshot_to, None
-                path.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(path), img)
-
-            shown = cv2.flip(img, 1) if self.mirror else img
-            rgb = cv2.cvtColor(shown, cv2.COLOR_BGR2RGB)
-            self.frame.emit(QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy())
+            snap, self.snapshot_to = self.snapshot_to, None
+            sent = sender.submit(output, img, vcam, self.mirror, snap)
 
             dt = now - t_prev
             t_prev = now
             if dt > 0:
                 fps = fps * 0.9 + (1 / dt) * 0.1 if fps else 1 / dt
             self.stats.emit(fps, faces_n, covered)
-        cap.release()
+        if job:
+            job.result()
+        if sent:
+            sent.result()
+        for pool in (analyst, helper, sender):
+            pool.shutdown()
+        grab.stop()
         if vcam:
             vcam.close()
         if media:
@@ -1366,6 +1512,11 @@ class Main(QMainWindow):
         if not self.cams:
             self.cam.addItem("Камер не найдено", 0)
         s.addWidget(self.cam)
+        self.low_light = ToggleRow("Ярче в темноте", False,
+                                   "Камера сама удлиняет выдержку и в полутьме снижает частоту до 5–15 кадров. "
+                                   "Выключено — всегда максимум кадров (до 60), тёмный кадр осветляется программно.")
+        self.low_light.setVisible(not IS_WIN)  # через DirectShow эту настройку камеры не задать
+        s.addWidget(self.low_light)
         self.mirror = ToggleRow("Зеркалить превью", True)
         s.addWidget(self.mirror)
         self.vcam = ToggleRow("Виртуальная камера", False, self.vcam_idle_text())
@@ -1414,6 +1565,7 @@ class Main(QMainWindow):
         self.oval.toggle.toggled.connect(lambda v: setattr(self.worker, "oval", v))
         self.failsafe.toggle.toggled.connect(lambda v: setattr(self.worker, "failsafe", v))
         self.mirror.toggle.toggled.connect(lambda v: setattr(self.worker, "mirror", v))
+        self.low_light.toggle.toggled.connect(self.worker.set_low_light)
         self.rotate.toggle.toggled.connect(lambda v: setattr(self.worker, "rotate", v))
         self.match_color.toggle.toggled.connect(lambda v: setattr(self.worker, "match_color", v))
         self.keep_mouth.toggle.toggled.connect(lambda v: setattr(self.worker, "keep_mouth", v))
@@ -1457,6 +1609,9 @@ class Main(QMainWindow):
         w.mirror, w.rotate = self.mirror.toggle.isChecked(), self.rotate.toggle.isChecked()
         w.match_color, w.keep_mouth = self.match_color.toggle.isChecked(), self.keep_mouth.toggle.isChecked()
         w.feather = self.feather.slider.value() / 100
+        self.low_light.toggle.setChecked(st.value("low_light", False, type=bool))
+        self.low_light.toggle.set_knob(1.0 if self.low_light.toggle.isChecked() else 0.0)
+        w.low_light = self.low_light.toggle.isChecked()
 
         cam = st.value("camera", "")
         i = next((n for n, (_, name) in enumerate(self.cams) if name == cam), 0)
@@ -1516,6 +1671,7 @@ class Main(QMainWindow):
         if self.cams:
             st.setValue("camera", self.cams[self.cam.currentIndex()][1])
         st.setValue("vcam", self.vcam.toggle.isChecked())
+        st.setValue("low_light", self.low_light.toggle.isChecked())
 
     # ── свои маски ──
 

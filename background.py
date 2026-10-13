@@ -50,10 +50,10 @@ def blurred(frame, strength):
 def composite(frame, mask, bg):
     """Человек из frame, остальное — из bg (той же формы). Работает прямо в frame."""
     h, w = frame.shape[:2]
-    # край считаем в половинном разрешении — в 3–4 раза быстрее, а на глаз разницы нет
-    m = cv2.resize(mask, (max(1, w // 2), max(1, h // 2)), interpolation=cv2.INTER_LINEAR)
+    # край считаем в четверти разрешения — сама сегментация ещё мельче (256×144), так что разницы нет
+    m = cv2.resize(mask, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_LINEAR)
     m = np.clip((m - 0.3) * 2.5, 0.0, 1.0)   # край сегментации размытый — делаем его чётче
     m = m * m * (3 - 2 * m)                  # плавная ступенька вместо резкой
-    m = cv2.GaussianBlur(m, (0, 0), max(0.8, w / 1800))
+    m = cv2.GaussianBlur(m, (0, 0), max(0.5, w / 3600))
     m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
-    frame[:] = cv2.blendLinear(frame, bg, m, 1.0 - m)
+    cv2.blendLinear(frame, bg, m, 1.0 - m, dst=frame)
